@@ -135,6 +135,8 @@ class LoopSettings:
 	output_sample_rate: int
 	loop_start_ms: float
 	loop_end_ms: float
+	render_length_seconds: float
+	render_mode: str
 
 
 @dataclass(frozen=True)
@@ -934,6 +936,17 @@ def detect_best_loop_region(sound: parselmouth.Sound) -> tuple[float, float]:
 	return best[1] * 1000.0 / sound.sampling_frequency, best[2] * 1000.0 / sound.sampling_frequency
 
 
+def render_loop_duration(sound: parselmouth.Sound, duration_seconds: float) -> parselmouth.Sound:
+	"""Repeat a prepared seamless cycle to an exact exported note duration."""
+	frames = sound.get_number_of_samples()
+	target_frames = max(1, int(round(duration_seconds * sound.sampling_frequency)))
+	if frames <= 0:
+		raise ValueError("Cannot render an empty loop.")
+	repeats = int(math.ceil(target_frames / frames))
+	values = np.tile(np.asarray(sound.values, dtype=np.float64), (1, repeats))[:, :target_frames]
+	return parselmouth.Sound(values, sound.sampling_frequency)
+
+
 def loop_samples(
 	settings: LoopSettings,
 	on_progress: Callable[[int, int, str], None],
@@ -956,6 +969,8 @@ def loop_samples(
 		end = int(np.clip(round(settings.loop_end_ms * sound.sampling_frequency / 1000.0), start + 1, frames))
 		selected = parselmouth.Sound(np.asarray(sound.values[:, start:end], dtype=np.float64), sound.sampling_frequency)
 		looped = make_seamless_loop(selected, settings.crossfade_ms)
+		if settings.render_mode == "Render exact duration":
+			looped = render_loop_duration(looped, settings.render_length_seconds)
 		output = settings.output_dir / f"{source.stem}_loop.wav"
 		looped.save(str(output), "WAV")
 		on_log(f"  wrote {output.name}")
@@ -1395,7 +1410,14 @@ class GeneratorWindow(QMainWindow):
 		self.loop_zero_snap_input.setChecked(True)
 		self.loop_sample_rate_input = QComboBox()
 		self.loop_sample_rate_input.addItems(SAMPLE_RATES)
-		loop_group = QGroupBox("Seamless Loop")
+		self.loop_render_mode_input = QComboBox()
+		self.loop_render_mode_input.addItems(["Render exact duration", "Save one seamless cycle"])
+		self.loop_render_length_input = QDoubleSpinBox()
+		self.loop_render_length_input.setRange(0.05, 120.0)
+		self.loop_render_length_input.setValue(2.0)
+		self.loop_render_length_input.setDecimals(3)
+		self.loop_render_length_input.setSuffix(" s")
+		loop_group = QGroupBox("Loop Region & Render")
 		loop_form = QFormLayout(loop_group)
 		loop_form.addRow("Preview sample:", self.loop_file_selector)
 		loop_form.addRow("Loop start:", self.loop_start_input)
@@ -1403,9 +1425,11 @@ class GeneratorWindow(QMainWindow):
 		loop_form.addRow("", self.loop_auto_button)
 		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
 		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
+		loop_form.addRow("Export mode:", self.loop_render_mode_input)
+		loop_form.addRow("Final rendered length:", self.loop_render_length_input)
 		loop_form.addRow("", self.loop_trim_input)
 		loop_form.addRow("", self.loop_zero_snap_input)
-		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. The selected tail is crossfaded into its head, so each saved WAV can repeat without a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
+		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. Choose an exact final render length to create held FNF notes, or save one clean loop cycle for a sampler. The selected tail is crossfaded into its head to avoid a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
 		help_label.setWordWrap(True)
 		loop_form.addRow(help_label)
 		controls.addWidget(loop_group)
@@ -1413,17 +1437,20 @@ class GeneratorWindow(QMainWindow):
 		preview_group = QGroupBox("Loop Preview Piano")
 		preview_layout = QGridLayout(preview_group)
 		self.loop_piano_buttons: list[QPushButton] = []
-		for offset, name in enumerate(NOTES):
-			button = QPushButton(name)
+		for offset in range(24):
+			button = QPushButton(note_label(0, 4, offset))
 			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_loop_piano(note_offset))
-			preview_layout.addWidget(button, 0, offset)
+			preview_layout.addWidget(button, offset // 12, offset % 12)
 			self.loop_piano_buttons.append(button)
 		self.loop_play_source_button = QPushButton("A: Play Selected Source")
 		self.loop_play_source_button.clicked.connect(lambda: self.play_loop_preview(looped=False))
 		self.loop_play_loop_button = QPushButton("B: Play Seamless Loop")
 		self.loop_play_loop_button.clicked.connect(lambda: self.play_loop_preview(looped=True))
-		preview_layout.addWidget(self.loop_play_source_button, 1, 0, 1, 6)
-		preview_layout.addWidget(self.loop_play_loop_button, 1, 6, 1, 6)
+		preview_layout.addWidget(self.loop_play_source_button, 2, 0, 1, 4)
+		preview_layout.addWidget(self.loop_play_loop_button, 2, 4, 1, 4)
+		self.loop_stop_button = QPushButton("Stop Preview")
+		self.loop_stop_button.clicked.connect(self.stop_loop_preview)
+		preview_layout.addWidget(self.loop_stop_button, 2, 8, 1, 4)
 		controls.addWidget(preview_group)
 
 		self.loop_button = QPushButton("Save Looped Samples")
@@ -1617,7 +1644,7 @@ class GeneratorWindow(QMainWindow):
 				pass
 			else:
 				if self.tabs.currentIndex() == 2:
-					self.play_loop_piano(offset % 12)
+					self.play_loop_piano(offset)
 				else:
 					self.play_keyboard_note(offset)
 				event.accept()
@@ -1956,7 +1983,10 @@ class GeneratorWindow(QMainWindow):
 		segment = self.selected_loop_segment()
 		if segment is None:
 			return None
-		return make_seamless_loop(segment, int(self.loop_crossfade_input.value()))
+		cycle = make_seamless_loop(segment, int(self.loop_crossfade_input.value()))
+		if self.loop_render_mode_input.currentText() == "Render exact duration":
+			return render_loop_duration(cycle, self.loop_render_length_input.value())
+		return cycle
 
 	def play_loop_preview(self, looped: bool) -> None:
 		sound = self.selected_loop_sound() if looped else self.selected_loop_segment()
@@ -1967,7 +1997,16 @@ class GeneratorWindow(QMainWindow):
 		self.loop_ab_sound = QSoundEffect(self)
 		self.loop_ab_sound.setSource(QUrl.fromLocalFile(str(path)))
 		self.loop_ab_sound.setVolume(0.8)
+		# B repeats the final render twice to make the seam easy to judge; A is a
+		# one-shot of the unprocessed selected region.
+		self.loop_ab_sound.setLoopCount(2 if looped else 1)
 		self.loop_ab_sound.play()
+
+	def stop_loop_preview(self) -> None:
+		if hasattr(self, "loop_ab_sound"):
+			self.loop_ab_sound.stop()
+		for sound in getattr(self, "loop_preview_cache", {}).values():
+			sound.stop()
 
 	def play_loop_piano(self, note_offset: int) -> None:
 		looped = self.selected_loop_sound()
@@ -2143,6 +2182,8 @@ class GeneratorWindow(QMainWindow):
 			output_sample_rate=int(self.loop_sample_rate_input.currentText()),
 			loop_start_ms=self.loop_start_input.value(),
 			loop_end_ms=self.loop_end_input.value(),
+			render_length_seconds=self.loop_render_length_input.value(),
+			render_mode=self.loop_render_mode_input.currentText(),
 		)
 		self.loop_log_output.clear()
 		self.loop_progress.setRange(0, max(1, len(self.loop_sources)))
@@ -2194,7 +2235,7 @@ class GeneratorWindow(QMainWindow):
 		loop_inputs: Iterable[QWidget] = (
 			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
 			self.loop_file_selector, self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
-			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_zero_snap_input,
+			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_stop_button, self.loop_zero_snap_input, self.loop_render_mode_input, self.loop_render_length_input,
 			*self.loop_piano_buttons,
 		)
 		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
