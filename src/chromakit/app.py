@@ -12,8 +12,9 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import parselmouth
-from PySide6.QtCore import QSettings, QThread, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QPalette, QPixmap, QTextCursor
+from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtCore import QSettings, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPalette, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 	QProgressBar,
 	QPushButton,
 	QSpinBox,
+	QSlider,
 	QStyle,
 	QTabWidget,
 	QTextEdit,
@@ -50,8 +52,10 @@ AUDIO_STYLES = {
 	"OG App": "Original app pitch - Praat formula at 48 kHz",
 	"Praat": "Praat pitch - no low-note FFT fallback",
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
-	"Vocal strain": "Adds natural vocal effort gradually above the source pitch",
-	"Scream / belt": "A stronger high-note belt with drive and presence",
+	"Vocal strain": "Formant-aware, restrained vocal effort for upward notes",
+	"Bright belt": "Praat pitch with bright, supported high-note presence",
+	"Scream / belt": "Praat pitch with stronger dynamic scream and belt texture",
+	"Rasp": "Praat pitch with a rougher, driven high-note edge",
 }
 
 # Expressive styles start building effort only after a moderate upward shift.  This
@@ -256,8 +260,12 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 		return retune_with_praat(sound, target_frequency)
 	if audio_style == "Vocal strain":
 		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.38)
+	if audio_style == "Bright belt":
+		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.46, roughness=0.0)
 	if audio_style == "Scream / belt":
-		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.70)
+		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.76, roughness=0.18)
+	if audio_style == "Rasp":
+		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.62, roughness=0.32)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -385,6 +393,34 @@ def retune_with_expressive_voice(
 		1.0,
 	)
 	return apply_vocal_drive(retuned, effort, maximum_drive)
+
+
+def apply_vocal_roughness(sound: parselmouth.Sound, effort: float, roughness: float) -> parselmouth.Sound:
+	"""Add a bounded, deterministic flutter to emulate vocal-fold irregularity."""
+	amount = float(np.clip(effort * roughness, 0.0, 0.35))
+	if amount <= 0:
+		return sound
+	values = np.asarray(sound.values, dtype=np.float64)
+	frames = values.shape[1]
+	if frames < 2:
+		return sound
+	time = np.arange(frames, dtype=np.float64) / sound.sampling_frequency
+	# Two slow, inharmonic flutter rates avoid a fixed tremolo tone.  This only
+	# becomes audible high above the source pitch where vocal effort is expected.
+	flutter = 1.0 + amount * (0.58 * np.sin(2.0 * math.pi * 27.0 * time) + 0.42 * np.sin(2.0 * math.pi * 41.0 * time + 0.7))
+	return parselmouth.Sound(np.clip(values * flutter.reshape(1, -1), -1.0, 1.0), sound.sampling_frequency)
+
+
+def retune_with_praat_expression(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, roughness: float,
+) -> parselmouth.Sound:
+	"""Build expressive styles on ChromaKit's direct Praat resynthesis path."""
+	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
+	# Unlike the formant-corrected style, this starts with the direct Praat pitch
+	# tier.  It keeps the familiar FNF pitch character before adding expression.
+	retuned = retune_with_praat(sound, target_frequency)
+	retuned = apply_vocal_drive(retuned, effort, maximum_drive)
+	return apply_vocal_roughness(retuned, effort, roughness)
 
 
 def retune_with_fft(sound: parselmouth.Sound, target_frequency: float) -> parselmouth.Sound | None:
@@ -820,6 +856,7 @@ class GeneratorWindow(QMainWindow):
 		self.tabs.addTab(self.build_generate_tab(), "Generate")
 		self.tabs.addTab(self.build_prepare_tab(), "Prepare Samples")
 		self.tabs.addTab(self.build_loop_tab(), "Loop Samples")
+		self.tabs.addTab(self.build_keyboard_tab(), "Keyboard")
 
 		self.statusBar().showMessage("Idle")
 		self.apply_system_brand_theme()
@@ -1169,6 +1206,119 @@ class GeneratorWindow(QMainWindow):
 		content.addWidget(output_group, 1)
 		return tab
 
+	def build_keyboard_tab(self) -> QWidget:
+		tab = QWidget()
+		layout = QVBoxLayout(tab)
+		layout.setContentsMargins(16, 14, 16, 14)
+		layout.setSpacing(12)
+		intro = QLabel("Test exported chromatic notes from your keyboard or by clicking a key. Select the folder that contains pitched_samples (or the exported WAV notes).")
+		intro.setWordWrap(True)
+		layout.addWidget(intro)
+
+		self.keyboard_folder_input = QLineEdit()
+		self.keyboard_folder_input.setReadOnly(True)
+		self.keyboard_folder_input.setPlaceholderText("Choose a chromatic or pitched_samples folder")
+		self.keyboard_folder_button = QPushButton("Choose Chromatic Folder")
+		self.keyboard_folder_button.clicked.connect(self.choose_keyboard_folder)
+		folder_row = QHBoxLayout()
+		folder_row.addWidget(self.keyboard_folder_input)
+		folder_row.addWidget(self.keyboard_folder_button)
+		layout.addLayout(folder_row)
+
+		self.keyboard_start_note_input = QComboBox()
+		self.keyboard_start_note_input.addItems(NOTES)
+		self.keyboard_start_note_input.setCurrentText("C")
+		self.keyboard_start_octave_input = QComboBox()
+		self.keyboard_start_octave_input.addItems(OCTAVES)
+		self.keyboard_start_octave_input.setCurrentText("2")
+		self.keyboard_start_note_input.currentTextChanged.connect(self.refresh_keyboard_labels)
+		self.keyboard_start_octave_input.currentTextChanged.connect(self.refresh_keyboard_labels)
+		self.keyboard_volume_input = QSlider(Qt.Horizontal)
+		self.keyboard_volume_input.setRange(0, 100)
+		self.keyboard_volume_input.setValue(80)
+		controls_group = QGroupBox("Keyboard Setup")
+		controls_form = QFormLayout(controls_group)
+		controls_form.addRow("First exported note:", self.keyboard_start_note_input)
+		controls_form.addRow("First exported octave:", self.keyboard_start_octave_input)
+		controls_form.addRow("Volume:", self.keyboard_volume_input)
+		layout.addWidget(controls_group)
+
+		self.keyboard_status_label = QLabel("Add a folder, then click a key. Physical keys cover two octaves: Z/S/X/D/C/V/G/B/H/N/J/M, then Q/2/W/3/E/R/5/T/6/Y/7/U.")
+		self.keyboard_status_label.setWordWrap(True)
+		layout.addWidget(self.keyboard_status_label)
+		keys_group = QGroupBox("Chromatic Test Keyboard")
+		keys_layout = QGridLayout(keys_group)
+		self.keyboard_buttons: list[QPushButton] = []
+		for offset in range(24):
+			button = QPushButton()
+			button.setMinimumHeight(58)
+			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_keyboard_note(note_offset))
+			keys_layout.addWidget(button, offset // 12, offset % 12)
+			self.keyboard_buttons.append(button)
+		layout.addWidget(keys_group, 1)
+		self.keyboard_files: list[Path] = []
+		self.keyboard_sounds: dict[Path, QSoundEffect] = {}
+		self.refresh_keyboard_labels()
+		return tab
+
+	def refresh_keyboard_labels(self, _unused: str = "") -> None:
+		if not hasattr(self, "keyboard_buttons"):
+			return
+		start_index = self.keyboard_start_note_input.currentIndex()
+		start_octave = int(self.keyboard_start_octave_input.currentText())
+		for offset, button in enumerate(self.keyboard_buttons):
+			button.setText(note_label(start_index, start_octave, offset))
+			button.setEnabled(bool(self.keyboard_files) and offset < len(self.keyboard_files))
+
+	def choose_keyboard_folder(self) -> None:
+		folder = QFileDialog.getExistingDirectory(self, "Choose chromatic or pitched_samples folder")
+		if not folder:
+			return
+		path = Path(folder)
+		# Selecting the generation folder is convenient; prefer its pitched export.
+		source_dir = path / "pitched_samples" if (path / "pitched_samples").is_dir() else path
+		self.keyboard_files = list_source_files(source_dir)
+		self.keyboard_sounds.clear()
+		self.keyboard_folder_input.setText(str(source_dir))
+		if self.keyboard_files:
+			self.keyboard_status_label.setText(f"Loaded {len(self.keyboard_files)} note file(s). Click a key or use the two-octave Z–M / Q–U key layout.")
+		else:
+			self.keyboard_status_label.setText("No note WAV files found. Generate with ‘Dump individual samples’ enabled, then choose its pitched_samples folder.")
+		self.refresh_keyboard_labels()
+
+	def play_keyboard_note(self, offset: int) -> None:
+		if offset >= len(self.keyboard_files):
+			return
+		path = self.keyboard_files[offset]
+		sound = self.keyboard_sounds.get(path)
+		if sound is None:
+			sound = QSoundEffect(self)
+			sound.setSource(QUrl.fromLocalFile(str(path)))
+			sound.setLoopCount(1)
+			self.keyboard_sounds[path] = sound
+		sound.setVolume(self.keyboard_volume_input.value() / 100.0)
+		sound.stop()
+		sound.play()
+		self.keyboard_status_label.setText(f"Playing {self.keyboard_buttons[offset].text()} — {path.name}")
+
+	def keyPressEvent(self, event: QKeyEvent) -> None:
+		if self.tabs.currentIndex() == 3 and not event.isAutoRepeat():
+			keys = (
+				Qt.Key.Key_Z, Qt.Key.Key_S, Qt.Key.Key_X, Qt.Key.Key_D, Qt.Key.Key_C, Qt.Key.Key_V,
+				Qt.Key.Key_G, Qt.Key.Key_B, Qt.Key.Key_H, Qt.Key.Key_N, Qt.Key.Key_J, Qt.Key.Key_M,
+				Qt.Key.Key_Q, Qt.Key.Key_2, Qt.Key.Key_W, Qt.Key.Key_3, Qt.Key.Key_E, Qt.Key.Key_R,
+				Qt.Key.Key_5, Qt.Key.Key_T, Qt.Key.Key_6, Qt.Key.Key_Y, Qt.Key.Key_7, Qt.Key.Key_U,
+			)
+			try:
+				offset = keys.index(event.key())
+			except ValueError:
+				pass
+			else:
+				self.play_keyboard_note(offset)
+				event.accept()
+				return
+		super().keyPressEvent(event)
+
 	def system_theme_is_dark(self) -> bool:
 		scheme = QApplication.styleHints().colorScheme()
 		if scheme == Qt.ColorScheme.Dark:
@@ -1366,6 +1516,11 @@ class GeneratorWindow(QMainWindow):
 				self.set_prepare_sources(tuple(sorted(path.glob("*.wav"))), path / "prepared_samples")
 			elif self.tabs.currentIndex() == 2:
 				self.set_loop_sources(tuple(sorted(path.glob("*.wav"))), path / "looped_samples")
+			elif self.tabs.currentIndex() == 3:
+				source_dir = path / "pitched_samples" if (path / "pitched_samples").is_dir() else path
+				self.keyboard_files = list_source_files(source_dir)
+				self.keyboard_folder_input.setText(str(source_dir))
+				self.refresh_keyboard_labels()
 			else:
 				self.folder_input.setText(str(path))
 		elif path.suffix.lower() == ".wav" and self.tabs.currentIndex() == 1:

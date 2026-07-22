@@ -39,7 +39,7 @@ Use this if you have a long recording instead of clean short samples.
 - **Pitch samples**: changes each sample to match the notes.
 - **Audio style**: chooses the retuning character. **Formant corrected** is the clean default and preserves vocal formants.
   - **Vocal strain** gradually adds a small formant lift, harmonic drive, and presence after a source sample is pitched more than four semitones upward.
-  - **Scream / belt** is the stronger version for aggressive high notes. It responds smoothly to the upward interval, so low notes remain clean. It works best with a clean, voiced vocal source; it is an audio effect, not AI voice generation.
+  - **Bright belt**, **Scream / belt**, and **Rasp** build on the direct **Praat** pitch-resynthesis character, then add progressively stronger drive, presence, and (where applicable) controlled vocal roughness. They respond smoothly to the upward interval, so low notes remain clean. They work best with a clean, voiced vocal source; they are audio effects, not AI voice generation.
 - **Dump individual samples**: saves separate WAV files too.
 - **Trim silence from samples**: cuts quiet edges from samples.
 - **Peak normalize before pitch**: makes sample volume more even.
@@ -62,3 +62,8 @@ Use the **Loop Samples** tab to turn one or more WAV files into repeatable sampl
 3. Click **Save Looped Samples**.
 
 ChromaKit trims optional quiet edges, blends each file’s tail into its head, and writes `<original-name>_loop.wav` files in a `looped_samples/` folder beside the source. The loop boundary lands on consecutive waveform samples, eliminating the hard boundary click when the file repeats.
+
+
+## Test a Chromatic with the Keyboard
+
+The **Keyboard** tab previews exported note WAVs without leaving ChromaKit. Choose the generation folder (the app automatically uses its `pitched_samples/` folder) or choose that folder directly. Set the first note to match the chromatic, then click any of the 24 note buttons. You can also use two physical-key rows: `Z S X D C V G B H N J M` and `Q 2 W 3 E R 5 T 6 Y 7 U`. Generate with **Dump individual samples** enabled before testing.
