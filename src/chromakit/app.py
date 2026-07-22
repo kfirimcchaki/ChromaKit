@@ -8,12 +8,15 @@ import random
 import struct
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import parselmouth
-from PySide6.QtCore import QSettings, QThread, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QPalette, QPixmap, QTextCursor
+from pedalboard import Compressor, HighShelfFilter, HighpassFilter, Limiter, Pedalboard
+from PySide6.QtMultimedia import QSoundEffect
+from PySide6.QtCore import QSettings, QThread, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPainter, QPalette, QColor, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -32,6 +35,7 @@ from PySide6.QtWidgets import (
 	QProgressBar,
 	QPushButton,
 	QSpinBox,
+	QSlider,
 	QStyle,
 	QTabWidget,
 	QTextEdit,
@@ -50,7 +54,20 @@ AUDIO_STYLES = {
 	"OG App": "Original app pitch - Praat formula at 48 kHz",
 	"Praat": "Praat pitch - no low-note FFT fallback",
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
+	"Vocal strain": "Formant-aware, restrained vocal effort for upward notes",
+	"Bright belt": "Praat pitch with bright, supported high-note presence",
+	"Yell / shout": "Stable high-note shout; lower notes stay clean and level-matched",
+	"Vocal impact": "Controlled high-note intensity with matched output loudness",
+	"Scream / belt": "Stable formant-aware belt with protected peaks and matched loudness",
+	"Ultimate yell / scream": "Highest-quality stable scream: clean lows, controlled high-note power",
+	"Rasp": "Clean vocal grit without synthetic flutter",
 }
+
+# Expressive styles start building effort only after a moderate upward shift.  This
+# leaves low notes clean and makes the effect follow the actual interval rather
+# than an arbitrary absolute octave.
+STRAIN_START_SEMITONES = 4.0
+STRAIN_FULL_SEMITONES = 19.0
 DEFAULT_SAMPLE_RATE = 48000
 LOW_NOTE_FFT_THRESHOLD = 60.0
 BRAND_CHROMA_COLOR = "#0D1524"
@@ -113,9 +130,186 @@ class PrepareSettings:
 
 
 @dataclass(frozen=True)
+class LoopSettings:
+	source_paths: tuple[Path, ...]
+	output_dir: Path
+	crossfade_ms: int
+	trim_silence: bool
+	output_sample_rate: int
+	loop_start_ms: float
+	loop_end_ms: float
+	render_length_seconds: float
+	render_mode: str
+	crossfade_curve: str
+	match_loop_gain: bool
+
+
+@dataclass(frozen=True)
 class SliceMarker:
 	offset: int
 	label: str
+
+
+class WaveformView(QWidget):
+	"""A lightweight editable waveform with draggable loop-start/end markers."""
+	range_changed = Signal(float, float)
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.setMinimumHeight(170)
+		self.values = np.empty(0, dtype=np.float64)
+		self.sample_rate = DEFAULT_SAMPLE_RATE
+		self.start_frame = 0
+		self.end_frame = 0
+		self._drag_marker: str | None = None
+
+	def set_sound(self, sound: parselmouth.Sound) -> None:
+		self.values = np.asarray(sound.values[0], dtype=np.float64)
+		self.sample_rate = int(sound.sampling_frequency)
+		self.start_frame = 0
+		self.end_frame = len(self.values)
+		self.update()
+
+	def set_range_ms(self, start_ms: float, end_ms: float, emit: bool = False) -> None:
+		frames = len(self.values)
+		if not frames:
+			return
+		self.start_frame = int(np.clip(round(start_ms * self.sample_rate / 1000.0), 0, frames - 1))
+		self.end_frame = int(np.clip(round(end_ms * self.sample_rate / 1000.0), self.start_frame + 1, frames))
+		self.update()
+		if emit:
+			self.range_changed.emit(self.start_frame * 1000.0 / self.sample_rate, self.end_frame * 1000.0 / self.sample_rate)
+
+	def _frame_at_x(self, x: float) -> int:
+		if not len(self.values):
+			return 0
+		return int(np.clip(round(x / max(1, self.width() - 1) * len(self.values)), 0, len(self.values)))
+
+	def paintEvent(self, _event: object) -> None:
+		painter = QPainter(self)
+		painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
+		if not len(self.values):
+			painter.drawText(self.rect(), Qt.AlignCenter, "Select a WAV sample to view and adjust its loop region")
+			return
+		width, height = max(1, self.width()), max(1, self.height())
+		mid = height / 2
+		painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 1))
+		painter.drawLine(0, int(mid), width, int(mid))
+		painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 1))
+		for x in range(width):
+			left = int(x * len(self.values) / width)
+			right = max(left + 1, int((x + 1) * len(self.values) / width))
+			chunk = self.values[left:right]
+			low = mid - float(np.min(chunk)) * (height * 0.43)
+			high = mid - float(np.max(chunk)) * (height * 0.43)
+			painter.drawLine(x, int(low), x, int(high))
+		for frame, color, text in ((self.start_frame, "#35c759", "Start"), (self.end_frame, "#ff9f0a", "End")):
+			x = int(frame / len(self.values) * width)
+			painter.setPen(QPen(QColor(color), 2))
+			painter.drawLine(x, 0, x, height)
+			painter.drawText(x + 3, 15, text)
+
+	def mousePressEvent(self, event: object) -> None:
+		if not len(self.values):
+			return
+		frame = self._frame_at_x(event.position().x())
+		self._drag_marker = "start" if abs(frame - self.start_frame) <= abs(frame - self.end_frame) else "end"
+		self.mouseMoveEvent(event)
+
+	def mouseMoveEvent(self, event: object) -> None:
+		if self._drag_marker is None or not len(self.values):
+			return
+		frame = self._frame_at_x(event.position().x())
+		if self._drag_marker == "start":
+			self.start_frame = min(frame, self.end_frame - 1)
+		else:
+			self.end_frame = max(frame, self.start_frame + 1)
+		self.update()
+		self.range_changed.emit(self.start_frame * 1000.0 / self.sample_rate, self.end_frame * 1000.0 / self.sample_rate)
+
+	def mouseReleaseEvent(self, _event: object) -> None:
+		self._drag_marker = None
+
+
+@dataclass(frozen=True)
+class PianoRollNote:
+	step: int
+	pitch: int
+	velocity: int = 100
+
+
+class PianoRollView(QWidget):
+	"""A compact step piano-roll for auditioning an exported chromatic."""
+	notes_changed = Signal()
+
+	def __init__(self, steps: int = 16, pitches: int = 24) -> None:
+		super().__init__()
+		self.steps = steps
+		self.pitches = pitches
+		self.notes: dict[tuple[int, int], int] = {}
+		self.playhead = -1
+		self.setMinimumHeight(260)
+		self.setMinimumWidth(580)
+
+	def set_playhead(self, step: int) -> None:
+		self.playhead = step
+		self.update()
+
+	def clear_notes(self) -> None:
+		self.notes.clear()
+		self.update()
+		self.notes_changed.emit()
+
+	def add_note(self, step: int, pitch: int, velocity: int) -> None:
+		self.notes[(max(0, min(self.steps - 1, step)), max(0, min(self.pitches - 1, pitch)))] = velocity
+		self.update()
+		self.notes_changed.emit()
+
+	def notes_at(self, step: int) -> list[PianoRollNote]:
+		return [PianoRollNote(note_step, pitch, velocity) for (note_step, pitch), velocity in self.notes.items() if note_step == step]
+
+	def _cell_at(self, x: float, y: float) -> tuple[int, int]:
+		step = int(np.clip(x / max(1, self.width()) * self.steps, 0, self.steps - 1))
+		# Lowest note is drawn at the bottom, like a conventional piano roll.
+		pitch = self.pitches - 1 - int(np.clip(y / max(1, self.height()) * self.pitches, 0, self.pitches - 1))
+		return step, pitch
+
+	def mousePressEvent(self, event: object) -> None:
+		step, pitch = self._cell_at(event.position().x(), event.position().y())
+		key = (step, pitch)
+		if key in self.notes:
+			del self.notes[key]
+		else:
+			self.notes[key] = 100
+		self.update()
+		self.notes_changed.emit()
+
+	def paintEvent(self, _event: object) -> None:
+		painter = QPainter(self)
+		painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
+		width, height = max(1, self.width()), max(1, self.height())
+		cell_w, cell_h = width / self.steps, height / self.pitches
+		grid_pen = QPen(self.palette().color(QPalette.ColorRole.Mid), 1)
+		painter.setPen(grid_pen)
+		for step in range(self.steps + 1):
+			x = int(step * cell_w)
+			painter.drawLine(x, 0, x, height)
+		for pitch in range(self.pitches + 1):
+			y = int(pitch * cell_h)
+			painter.drawLine(0, y, width, y)
+		# Shade black-key lanes to make the grid read like a piano roll.
+		for pitch in range(self.pitches):
+			if NOTES[pitch % 12] in {"C#", "D#", "F#", "G#", "A#"}:
+				painter.fillRect(0, int((self.pitches - pitch - 1) * cell_h), width, max(1, int(cell_h)), QColor(0, 0, 0, 25))
+		for (step, pitch), velocity in self.notes.items():
+			y = int((self.pitches - pitch - 1) * cell_h)
+			color = QColor("#0A8CE6")
+			color.setAlpha(120 + int(velocity * 1.3))
+			painter.fillRect(int(step * cell_w) + 2, y + 2, max(1, int(cell_w) - 3), max(1, int(cell_h) - 3), color)
+		if 0 <= self.playhead < self.steps:
+			painter.setPen(QPen(QColor("#ff9f0a"), 2))
+			x = int(self.playhead * cell_w)
+			painter.drawLine(x, 0, x, height)
 
 
 class CancelledError(Exception):
@@ -237,6 +431,20 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 		return retune_with_formant_correction(sound, target_frequency)
 	if audio_style == "Praat":
 		return retune_with_praat(sound, target_frequency)
+	if audio_style == "Vocal strain":
+		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.38)
+	if audio_style == "Bright belt":
+		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.34)
+	if audio_style == "Yell / shout":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.26, intensity=0.45)
+	if audio_style == "Vocal impact":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.32, intensity=0.65)
+	if audio_style == "Scream / belt":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.38, intensity=0.82)
+	if audio_style == "Ultimate yell / scream":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.42, intensity=1.0)
+	if audio_style == "Rasp":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.28, intensity=0.58)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -283,6 +491,174 @@ def retune_with_formant_correction(sound: parselmouth.Sound, target_frequency: f
 		1.0,
 		1.0,
 	)
+
+
+def estimated_voice_frequency(sound: parselmouth.Sound) -> float | None:
+	"""Return a conservative median F0 for interval-aware vocal styles."""
+	try:
+		pitch = parselmouth.praat.call(sound, "To Pitch", 0.0, 50.0, 900.0)
+		frequency = float(parselmouth.praat.call(pitch, "Get quantile", 0, 0, 0.5, "Hertz"))
+	except Exception:
+		return None
+	if not math.isfinite(frequency) or frequency <= 0:
+		return None
+	return frequency
+
+
+def vocal_effort_for_interval(source_frequency: float | None, target_frequency: float) -> float:
+	"""Map an upward pitch interval to a smooth 0--1 vocal-effort amount."""
+	if source_frequency is None or source_frequency <= 0 or target_frequency <= 0:
+		return 0.0
+	semitones = 12.0 * math.log2(target_frequency / source_frequency)
+	return float(np.clip(
+		(semitones - STRAIN_START_SEMITONES) / (STRAIN_FULL_SEMITONES - STRAIN_START_SEMITONES),
+		0.0,
+		1.0,
+	))
+
+
+def apply_vocal_drive(sound: parselmouth.Sound, effort: float, maximum_drive: float) -> parselmouth.Sound:
+	"""Add restrained harmonic drive and presence without changing note length.
+
+	This is deliberately a post-process, not generated noise: it retains the
+	speaker's articulation while a soft saturation and a little pre-emphasis make
+	high notes read more like a supported belt.  It cannot turn a non-vocal source
+	into a real human scream, but avoids a sudden/artificial switch at one note.
+	"""
+	amount = float(np.clip(effort * maximum_drive, 0.0, 0.85))
+	if amount <= 0:
+		return sound
+	values = np.asarray(sound.values, dtype=np.float64)
+	if values.size == 0:
+		return sound
+	peak = float(np.max(np.abs(values)))
+	if peak <= 1e-9:
+		return sound
+
+	# Level-independent soft clipping supplies upper harmonics.  Pre-emphasis is
+	# mixed in lightly to preserve the brighter, open quality of a high belt.
+	normalized = values / peak
+	drive = 1.0 + 5.0 * amount
+	saturated = np.tanh(normalized * drive) / math.tanh(drive)
+	previous = np.concatenate((normalized[:, :1], normalized[:, :-1]), axis=1)
+	presence = normalized - 0.90 * previous
+	# Keep the natural scale of the differentiated signal.  Normalizing it to its
+	# single highest sample exaggerates clicks and makes the old Rasp preset hiss.
+	mixed = (1.0 - amount) * normalized + amount * saturated + (0.30 * amount) * presence
+	# Keep the source peak (and therefore downstream normalization behavior) stable.
+	mixed_peak = max(float(np.max(np.abs(mixed))), 1e-9)
+	return parselmouth.Sound(np.clip(mixed * (peak / mixed_peak), -1.0, 1.0), sound.sampling_frequency)
+
+
+def retune_with_expressive_voice(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float,
+) -> parselmouth.Sound:
+	"""Pitch a voice and increase effort smoothly as the target goes higher."""
+	source_frequency = estimated_voice_frequency(sound)
+	effort = vocal_effort_for_interval(source_frequency, target_frequency)
+	pitch_floor = 37.5 if target_frequency < LOW_NOTE_FFT_THRESHOLD else 60.0
+	pitch_ceiling = 1200.0 if target_frequency < LOW_NOTE_FFT_THRESHOLD else 600.0
+	# Singers tend to raise formants slightly and use a wider pitch range as they
+	# belt.  The bounded values stay considerably subtler than chipmunk shifting.
+	retuned = parselmouth.praat.call(
+		sound,
+		"Change gender...",
+		pitch_floor,
+		pitch_ceiling,
+		1.0 + 0.16 * effort,
+		target_frequency,
+		1.0 + 0.30 * effort,
+		1.0,
+	)
+	return apply_vocal_drive(retuned, effort, maximum_drive)
+
+
+def match_output_loudness(reference: parselmouth.Sound, rendered: parselmouth.Sound) -> parselmouth.Sound:
+	"""Keep expressive processing from making one chromatic note jump in volume."""
+	reference_values = np.asarray(reference.values, dtype=np.float64)
+	rendered_values = np.asarray(rendered.values, dtype=np.float64)
+	if reference_values.size == 0 or rendered_values.size == 0:
+		return rendered
+	# RMS is calculated only over audible frames, so trailing silence does not
+	# make the compensation explode. Restricting gain prevents small analysis
+	# errors from turning a vocal into a pumping/compressed note.
+	reference_active = reference_values[np.abs(reference_values) > 1e-4]
+	rendered_active = rendered_values[np.abs(rendered_values) > 1e-4]
+	if not reference_active.size or not rendered_active.size:
+		return rendered
+	reference_rms = float(np.sqrt(np.mean(reference_active * reference_active)))
+	rendered_rms = float(np.sqrt(np.mean(rendered_active * rendered_active)))
+	if reference_rms <= 1e-8 or rendered_rms <= 1e-8:
+		return rendered
+	gain = float(np.clip(reference_rms / rendered_rms, 0.72, 1.38))
+	reference_peak = float(np.max(np.abs(reference_values)))
+	adjusted = rendered_values * gain
+	adjusted_peak = float(np.max(np.abs(adjusted)))
+	if adjusted_peak > max(reference_peak, 1e-8):
+		adjusted *= reference_peak / adjusted_peak
+	return parselmouth.Sound(np.clip(adjusted, -1.0, 1.0), rendered.sampling_frequency)
+
+
+def apply_studio_vocal_finish(sound: parselmouth.Sound, effort: float, intensity: float) -> parselmouth.Sound:
+	"""Use a transparent studio dynamics chain after formant-aware resynthesis.
+
+	A scream effect sounds artificial when it is mostly distortion or LFO flutter.
+	This chain instead controls peaks, removes unnecessary low rumble, and adds a
+	bounded presence lift that only arrives as the singer is pushed higher.
+	"""
+	amount = float(np.clip(effort * intensity, 0.0, 1.0))
+	if amount <= 0:
+		return sound
+	board = Pedalboard([
+		HighpassFilter(cutoff_frequency_hz=65.0),
+		Compressor(threshold_db=-18.0 + 4.0 * (1.0 - amount), ratio=1.3 + 1.7 * amount, attack_ms=8.0, release_ms=90.0),
+		HighShelfFilter(cutoff_frequency_hz=2400.0, gain_db=1.0 + 3.0 * amount, q=0.8),
+		Limiter(threshold_db=-1.0, release_ms=80.0),
+	])
+	processed = board(np.asarray(sound.values, dtype=np.float32), sound.sampling_frequency)
+	rendered = parselmouth.Sound(np.clip(np.asarray(processed, dtype=np.float64), -1.0, 1.0), sound.sampling_frequency)
+	return match_output_loudness(sound, rendered)
+
+
+def retune_with_human_scream(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, intensity: float,
+) -> parselmouth.Sound:
+	"""A vocal-preserving high-note style with a polished dynamics finish.
+
+	It intentionally does not invent buzz or random noise. The source voice supplies
+	the rasp; formant-aware retuning, gentle drive, compression, and peak limiting
+	make the rising note feel supported without destroying intelligibility.
+	"""
+	retuned = retune_with_expressive_voice(sound, target_frequency, maximum_drive)
+	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
+	return apply_studio_vocal_finish(retuned, effort, intensity)
+
+
+def retune_with_ultimate_vocal(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, intensity: float,
+) -> parselmouth.Sound:
+	"""Stable scream/yell processing designed for a complete FNF chromatic range."""
+	source_frequency = estimated_voice_frequency(sound)
+	effort = vocal_effort_for_interval(source_frequency, target_frequency)
+	# The old styles ran the aggressive chain on every note. Below the strain
+	# threshold that produces bouncy low notes and inconsistent volume, so use
+	# the stable formant-corrected renderer with no color processing instead.
+	if effort < 0.035:
+		return retune_with_formant_correction(sound, target_frequency)
+	retuned = retune_with_expressive_voice(sound, target_frequency, maximum_drive)
+	finished = apply_studio_vocal_finish(retuned, effort, intensity)
+	return match_output_loudness(retuned, finished)
+
+
+def retune_with_praat_expression(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float,
+) -> parselmouth.Sound:
+	"""Build expressive styles on ChromaKit's direct Praat resynthesis path."""
+	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
+	# Unlike the formant-corrected style, this starts with the direct Praat pitch
+	# tier.  It keeps the familiar FNF pitch character before adding expression.
+	retuned = retune_with_praat(sound, target_frequency)
+	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
 def retune_with_fft(sound: parselmouth.Sound, target_frequency: float) -> parselmouth.Sound | None:
@@ -570,6 +946,153 @@ def prepare_samples(
 	return settings.output_dir
 
 
+def make_seamless_loop(
+	sound: parselmouth.Sound, crossfade_ms: int, crossfade_curve: str = "Equal power", match_loop_gain: bool = True,
+) -> parselmouth.Sound:
+	"""Create a repeatable loop by wrapping and crossfading its tail into its head.
+
+	The last rendered sample becomes the sample immediately before the loop start,
+	so consecutive plays meet without a discontinuity (the usual source of clicks).
+	"""
+	values = np.asarray(sound.values, dtype=np.float64)
+	if values.ndim == 1:
+		values = values.reshape(1, -1)
+	frames = values.shape[1]
+	if frames < 4:
+		raise ValueError("A sample needs at least four frames to be looped.")
+	crossfade = int(round(crossfade_ms * sound.sampling_frequency / 1000.0))
+	crossfade = min(max(1, crossfade), max(1, frames // 3))
+	# Begin after the head used at the seam.  The final blended frame therefore
+	# flows directly into output frame zero when the file repeats.
+	loop = values[:, crossfade:].copy()
+	head = values[:, :crossfade]
+	tail = values[:, -crossfade:].copy()
+	if match_loop_gain:
+		head_rms = float(np.sqrt(np.mean(head * head)))
+		tail_rms = float(np.sqrt(np.mean(tail * tail)))
+		if head_rms > 1e-8 and tail_rms > 1e-8:
+			# A modest gain match prevents an audible loudness bump at a vowel loop
+			# without radically changing the character of a naturally fading sample.
+			tail *= float(np.clip(head_rms / tail_rms, 0.5, 2.0))
+	linear = np.linspace(0.0, 1.0, crossfade, endpoint=True)
+	if crossfade_curve == "Equal power":
+		fade_in = np.sin(linear * math.pi / 2.0)
+		fade_out = np.cos(linear * math.pi / 2.0)
+	else:
+		fade_in = linear
+		fade_out = 1.0 - linear
+	loop[:, -crossfade:] = tail * fade_out + head * fade_in
+	return parselmouth.Sound(np.clip(loop, -1.0, 1.0), sound.sampling_frequency)
+
+
+def snap_to_zero_crossing(values: np.ndarray, frame: int, radius: int) -> int:
+	"""Choose the nearest low-amplitude sign crossing for a click-resistant edit."""
+	if len(values) < 2:
+		return frame
+	left, right = max(1, frame - radius), min(len(values) - 1, frame + radius)
+	candidates = [index for index in range(left, right + 1) if values[index - 1] * values[index] <= 0]
+	if not candidates:
+		return int(np.clip(frame, 0, len(values) - 1))
+	return min(candidates, key=lambda index: abs(values[index - 1]) + abs(values[index]) + abs(index - frame) * 1e-5)
+
+
+def detect_best_loop_region(sound: parselmouth.Sound) -> tuple[float, float]:
+	"""Find and refine a voiced loop whose boundary has the lowest mismatch."""
+	mono = np.asarray(sound.values[0], dtype=np.float64)
+	frames = len(mono)
+	if frames < 16:
+		raise ValueError("Sample is too short to analyse for a loop.")
+	minimum = min(max(int(sound.sampling_frequency * 0.12), 8), max(2, frames // 3))
+	window = min(max(int(sound.sampling_frequency * 0.018), 8), max(4, frames // 12))
+	energy_floor = max(float(np.max(np.abs(mono))) * 0.045, 1e-6)
+
+	def score(start_frame: int, end_frame: int) -> float | None:
+		if end_frame - start_frame < minimum or start_frame < 0 or end_frame > frames:
+			return None
+		head = mono[start_frame:start_frame + window]
+		tail = mono[end_frame - window:end_frame]
+		if len(head) != window or len(tail) != window:
+			return None
+		head_rms = float(np.sqrt(np.mean(head * head)))
+		tail_rms = float(np.sqrt(np.mean(tail * tail)))
+		# FNF voice samples often have attacks and tails around a sustained vowel.
+		# Rejecting quiet regions keeps auto-detect from choosing silence as a loop.
+		if min(head_rms, tail_rms) < energy_floor:
+			return None
+		scale = max(head_rms, tail_rms, 1e-7)
+		shape_error = float(np.mean(((head - tail) / scale) ** 2))
+		slope_error = float(abs((head[1] - head[0]) - (tail[-1] - tail[-2])) / scale)
+		boundary_error = float(abs(head[0] - tail[-1]) / scale)
+		return shape_error + 0.35 * slope_error + 0.8 * boundary_error
+
+	# Coarse search finds matching voiced regions quickly, then a local search
+	# aligns each endpoint to a nearby zero crossing for a cleaner click-free seam.
+	points = np.unique(np.linspace(0, frames - 1, min(96, frames), dtype=int))
+	best: tuple[float, int, int] | None = None
+	for start_frame in points:
+		for end_frame in points:
+			value = score(int(start_frame), int(end_frame))
+			if value is not None and (best is None or value < best[0]):
+				best = (value, int(start_frame), int(end_frame))
+	if best is None:
+		return 0.0, frames * 1000.0 / sound.sampling_frequency
+
+	radius = max(1, int(sound.sampling_frequency * 0.014))
+	refined = best
+	for start_delta in np.linspace(-radius, radius, 9, dtype=int):
+		for end_delta in np.linspace(-radius, radius, 9, dtype=int):
+			start_frame = snap_to_zero_crossing(mono, best[1] + int(start_delta), radius // 3)
+			end_frame = snap_to_zero_crossing(mono, best[2] + int(end_delta), radius // 3)
+			value = score(start_frame, end_frame)
+			if value is not None and value < refined[0]:
+				refined = (value, start_frame, end_frame)
+	return refined[1] * 1000.0 / sound.sampling_frequency, refined[2] * 1000.0 / sound.sampling_frequency
+
+def render_loop_duration(sound: parselmouth.Sound, duration_seconds: float) -> parselmouth.Sound:
+	"""Repeat a prepared seamless cycle to an exact exported note duration."""
+	frames = sound.get_number_of_samples()
+	target_frames = max(1, int(round(duration_seconds * sound.sampling_frequency)))
+	if frames <= 0:
+		raise ValueError("Cannot render an empty loop.")
+	repeats = int(math.ceil(target_frames / frames))
+	values = np.tile(np.asarray(sound.values, dtype=np.float64), (1, repeats))[:, :target_frames]
+	return parselmouth.Sound(values, sound.sampling_frequency)
+
+
+def loop_samples(
+	settings: LoopSettings,
+	on_progress: Callable[[int, int, str], None],
+	on_log: Callable[[str], None],
+	should_cancel: Callable[[], bool],
+) -> Path:
+	sources = [path for path in settings.source_paths if path.suffix.lower() == ".wav" and path.is_file()]
+	if not sources:
+		raise ValueError("Choose one or more WAV files to loop.")
+	settings.output_dir.mkdir(exist_ok=True)
+	for index, source in enumerate(sources, start=1):
+		if should_cancel():
+			raise CancelledError()
+		on_log(f"[{index}/{len(sources)}] Looping {source.name}")
+		sound = load_mono(source, settings.output_sample_rate)
+		if settings.trim_silence:
+			sound = trim_edge_silence(sound)
+		frames = sound.get_number_of_samples()
+		start = int(np.clip(round(settings.loop_start_ms * sound.sampling_frequency / 1000.0), 0, max(0, frames - 1)))
+		end = int(np.clip(round(settings.loop_end_ms * sound.sampling_frequency / 1000.0), start + 1, frames))
+		selected = parselmouth.Sound(np.asarray(sound.values[:, start:end], dtype=np.float64), sound.sampling_frequency)
+		looped = make_seamless_loop(
+			selected, settings.crossfade_ms, settings.crossfade_curve, settings.match_loop_gain,
+		)
+		if settings.render_mode == "Render exact duration":
+			looped = render_loop_duration(looped, settings.render_length_seconds)
+		output = settings.output_dir / f"{source.stem}_loop.wav"
+		looped.save(str(output), "WAV")
+		on_log(f"  wrote {output.name}")
+		on_progress(index, len(sources), source.name)
+	on_log(f"Saved {len(sources)} looped sample(s) in: {settings.output_dir}")
+	return settings.output_dir
+
+
 class GenerationWorker(QThread):
 	progress = Signal(int, int, str)
 	log = Signal(str)
@@ -622,6 +1145,32 @@ class PrepareWorker(QThread):
 			self.done.emit(str(output))
 
 
+class LoopWorker(QThread):
+	progress = Signal(int, int, str)
+	log = Signal(str)
+	done = Signal(str)
+	failed = Signal(str)
+	cancelled = Signal(str)
+
+	def __init__(self, settings: LoopSettings) -> None:
+		super().__init__()
+		self.settings = settings
+		self._cancel = False
+
+	def request_cancel(self) -> None:
+		self._cancel = True
+
+	def run(self) -> None:
+		try:
+			output = loop_samples(self.settings, self.progress.emit, self.log.emit, lambda: self._cancel)
+		except CancelledError:
+			self.cancelled.emit("Looping cancelled.")
+		except Exception as error:
+			self.failed.emit(str(error))
+		else:
+			self.done.emit(str(output))
+
+
 class GeneratorWindow(QMainWindow):
 	def __init__(self) -> None:
 		super().__init__()
@@ -633,14 +1182,17 @@ class GeneratorWindow(QMainWindow):
 		self.setMinimumSize(920, 620)
 		self.setAcceptDrops(True)
 
-		self.worker: GenerationWorker | PrepareWorker | None = None
+		self.worker: GenerationWorker | PrepareWorker | LoopWorker | None = None
 		self.last_output_path: Path | None = None
 		self.prepare_sources: tuple[Path, ...] = ()
+		self.loop_sources: tuple[Path, ...] = ()
 
 		self.tabs = QTabWidget()
 		self.setCentralWidget(self.tabs)
 		self.tabs.addTab(self.build_generate_tab(), "Generate")
 		self.tabs.addTab(self.build_prepare_tab(), "Prepare Samples")
+		self.tabs.addTab(self.build_loop_tab(), "Loop Samples")
+		self.tabs.addTab(self.build_keyboard_tab(), "Keyboard")
 
 		self.statusBar().showMessage("Idle")
 		self.apply_system_brand_theme()
@@ -726,6 +1278,15 @@ class GeneratorWindow(QMainWindow):
 		self.gap_input.textChanged.connect(self.refresh_generation_validation)
 		self.order_input = QComboBox()
 		self.order_input.addItems(ORDER_MODES)
+		self.audio_style_input = QComboBox()
+		self.audio_style_input.addItems(list(AUDIO_STYLES))
+		self.audio_style_input.setCurrentText("Formant corrected")
+		self.audio_style_input.setToolTip("Choose how notes are retuned. Expressive styles react to the upward interval from each source sample.")
+		self.audio_style_description = QLabel()
+		self.audio_style_description.setWordWrap(True)
+		self.audio_style_description.setStyleSheet("color: palette(mid);")
+		self.audio_style_input.currentTextChanged.connect(self.update_audio_style_description)
+		self.update_audio_style_description(self.audio_style_input.currentText())
 
 		pitch_group = QGroupBox("Pitch and Range")
 		form = QFormLayout(pitch_group)
@@ -736,6 +1297,8 @@ class GeneratorWindow(QMainWindow):
 		form.addRow("Range:", self.range_input)
 		form.addRow("Sample gap:", self.gap_input)
 		form.addRow("Sample order:", self.order_input)
+		form.addRow("Audio style:", self.audio_style_input)
+		form.addRow("", self.audio_style_description)
 		pitch_tab = QWidget()
 		pitch_tab_layout = QVBoxLayout(pitch_tab)
 		pitch_tab_layout.setContentsMargins(8, 8, 8, 8)
@@ -747,10 +1310,6 @@ class GeneratorWindow(QMainWindow):
 		self.pitch_input.setChecked(True)
 		self.dump_input = QCheckBox("Dump individual samples")
 		self.dump_input.setChecked(True)
-		self.audio_style_input = QComboBox()
-		self.audio_style_input.addItems(list(AUDIO_STYLES))
-		self.audio_style_input.setCurrentText("Formant corrected")
-		self.audio_style_input.setToolTip("Choose the pitch processing style used while generating notes.")
 		self.trim_silence_input = QCheckBox("Trim silence from samples")
 		self.normalize_input = QCheckBox("Peak normalize before pitch")
 		self.slicex_input = QCheckBox("Embed FL Studio Slicex markers")
@@ -763,17 +1322,15 @@ class GeneratorWindow(QMainWindow):
 		options = QGridLayout(options_group)
 		options.addWidget(self.pitch_input, 0, 0)
 		options.addWidget(self.dump_input, 0, 1)
-		options.addWidget(QLabel("Audio style:"), 1, 0)
-		options.addWidget(self.audio_style_input, 1, 1)
-		options.addWidget(self.trim_silence_input, 2, 0)
-		options.addWidget(self.normalize_input, 2, 1)
-		options.addWidget(self.slicex_input, 3, 0, 1, 2)
-		options.addWidget(QLabel("Fade in/out (ms):"), 4, 0)
-		options.addWidget(self.fade_input, 4, 1)
-		options.addWidget(QLabel("Fixed note length (s):"), 5, 0)
-		options.addWidget(self.fixed_length_input, 5, 1)
-		options.addWidget(QLabel("Output sample rate:"), 6, 0)
-		options.addWidget(self.sample_rate_input, 6, 1)
+		options.addWidget(self.trim_silence_input, 1, 0)
+		options.addWidget(self.normalize_input, 1, 1)
+		options.addWidget(self.slicex_input, 2, 0, 1, 2)
+		options.addWidget(QLabel("Fade in/out (ms):"), 3, 0)
+		options.addWidget(self.fade_input, 3, 1)
+		options.addWidget(QLabel("Fixed note length (s):"), 4, 0)
+		options.addWidget(self.fixed_length_input, 4, 1)
+		options.addWidget(QLabel("Output sample rate:"), 5, 0)
+		options.addWidget(self.sample_rate_input, 5, 1)
 		processing_tab = QWidget()
 		processing_tab_layout = QVBoxLayout(processing_tab)
 		processing_tab_layout.setContentsMargins(8, 8, 8, 8)
@@ -915,6 +1472,311 @@ class GeneratorWindow(QMainWindow):
 
 		return tab
 
+	def build_loop_tab(self) -> QWidget:
+		tab = QWidget()
+		layout = QVBoxLayout(tab)
+		layout.setContentsMargins(16, 14, 16, 14)
+		content = QHBoxLayout()
+		layout.addLayout(content, 1)
+		controls = QVBoxLayout()
+		content.addLayout(controls, 0)
+
+		self.loop_source_input = QLineEdit()
+		self.loop_source_input.setReadOnly(True)
+		self.loop_source_input.setPlaceholderText("Choose one or more WAV samples to make seamless loops")
+		self.loop_files_button = QPushButton("Add WAV Samples")
+		self.loop_files_button.clicked.connect(self.choose_loop_files)
+		self.loop_folder_button = QPushButton("Add Folder")
+		self.loop_folder_button.clicked.connect(self.choose_loop_folder)
+		source_group = QGroupBox("Samples")
+		source_layout = QVBoxLayout(source_group)
+		source_layout.addWidget(self.loop_source_input)
+		source_buttons = QHBoxLayout()
+		source_buttons.addWidget(self.loop_files_button)
+		source_buttons.addWidget(self.loop_folder_button)
+		source_layout.addLayout(source_buttons)
+		controls.addWidget(source_group)
+
+		self.loop_file_selector = QComboBox()
+		self.loop_file_selector.currentIndexChanged.connect(self.select_loop_source)
+		self.loop_waveform = WaveformView()
+		self.loop_waveform.range_changed.connect(self.on_loop_waveform_range_changed)
+		self.loop_start_input = QDoubleSpinBox()
+		self.loop_start_input.setRange(0.0, 1_000_000.0)
+		self.loop_start_input.setDecimals(2)
+		self.loop_start_input.setSuffix(" ms")
+		self.loop_start_input.valueChanged.connect(self.on_loop_range_inputs_changed)
+		self.loop_end_input = QDoubleSpinBox()
+		self.loop_end_input.setRange(0.01, 1_000_000.0)
+		self.loop_end_input.setDecimals(2)
+		self.loop_end_input.setSuffix(" ms")
+		self.loop_end_input.valueChanged.connect(self.on_loop_range_inputs_changed)
+		self.loop_auto_button = QPushButton("Auto-detect Best Loop")
+		self.loop_auto_button.clicked.connect(self.auto_detect_loop)
+		self.loop_crossfade_input = QSpinBox()
+		self.loop_crossfade_input.setRange(1, 1000)
+		self.loop_crossfade_input.setValue(30)
+		self.loop_crossfade_input.setSuffix(" ms")
+		self.loop_crossfade_input.valueChanged.connect(self.clear_loop_preview_cache)
+		self.loop_crossfade_curve_input = QComboBox()
+		self.loop_crossfade_curve_input.addItems(["Equal power", "Linear"])
+		self.loop_crossfade_curve_input.currentTextChanged.connect(self.clear_loop_preview_cache)
+		self.loop_match_gain_input = QCheckBox("Match tail/head loudness at seam")
+		self.loop_match_gain_input.setChecked(True)
+		self.loop_match_gain_input.toggled.connect(self.clear_loop_preview_cache)
+		self.loop_trim_input = QCheckBox("Trim quiet edges before looping")
+		self.loop_trim_input.setChecked(True)
+		self.loop_trim_input.toggled.connect(lambda _checked: self.select_loop_source(self.loop_file_selector.currentIndex()))
+		self.loop_zero_snap_input = QCheckBox("Snap handles to zero crossings")
+		self.loop_zero_snap_input.setChecked(True)
+		self.loop_sample_rate_input = QComboBox()
+		self.loop_sample_rate_input.addItems(SAMPLE_RATES)
+		self.loop_render_mode_input = QComboBox()
+		self.loop_render_mode_input.addItems(["Render exact duration", "Save one seamless cycle"])
+		self.loop_render_length_input = QDoubleSpinBox()
+		self.loop_render_length_input.setRange(0.05, 120.0)
+		self.loop_render_length_input.setValue(2.0)
+		self.loop_render_length_input.setDecimals(3)
+		self.loop_render_length_input.setSuffix(" s")
+		loop_group = QGroupBox("Loop Region & Render")
+		loop_form = QFormLayout(loop_group)
+		loop_form.addRow("Preview sample:", self.loop_file_selector)
+		loop_form.addRow("Loop start:", self.loop_start_input)
+		loop_form.addRow("Loop end:", self.loop_end_input)
+		loop_form.addRow("", self.loop_auto_button)
+		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
+		loop_form.addRow("Crossfade curve:", self.loop_crossfade_curve_input)
+		loop_form.addRow("", self.loop_match_gain_input)
+		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
+		loop_form.addRow("Export mode:", self.loop_render_mode_input)
+		loop_form.addRow("Final rendered length:", self.loop_render_length_input)
+		loop_form.addRow("", self.loop_trim_input)
+		loop_form.addRow("", self.loop_zero_snap_input)
+		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. Choose an exact final render length to create held FNF notes, or save one clean loop cycle for a sampler. The selected tail is crossfaded into its head to avoid a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
+		help_label.setWordWrap(True)
+		loop_form.addRow(help_label)
+		self.loop_quality_label = QLabel("Seam quality: choose a sample region to analyse.")
+		self.loop_quality_label.setWordWrap(True)
+		loop_form.addRow(self.loop_quality_label)
+		controls.addWidget(loop_group)
+		controls.addWidget(self.loop_waveform)
+		preview_group = QGroupBox("Loop Preview Piano")
+		preview_layout = QGridLayout(preview_group)
+		self.loop_piano_buttons: list[QPushButton] = []
+		for offset in range(24):
+			button = QPushButton(note_label(0, 4, offset))
+			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_loop_piano(note_offset))
+			preview_layout.addWidget(button, offset // 12, offset % 12)
+			self.loop_piano_buttons.append(button)
+		self.loop_play_source_button = QPushButton("A: Play Selected Source")
+		self.loop_play_source_button.clicked.connect(lambda: self.play_loop_preview(looped=False))
+		self.loop_play_loop_button = QPushButton("B: Play Seamless Loop")
+		self.loop_play_loop_button.clicked.connect(lambda: self.play_loop_preview(looped=True))
+		preview_layout.addWidget(self.loop_play_source_button, 2, 0, 1, 4)
+		preview_layout.addWidget(self.loop_play_loop_button, 2, 4, 1, 4)
+		self.loop_stop_button = QPushButton("Stop Preview")
+		self.loop_stop_button.clicked.connect(self.stop_loop_preview)
+		preview_layout.addWidget(self.loop_stop_button, 2, 8, 1, 4)
+		controls.addWidget(preview_group)
+
+		self.loop_button = QPushButton("Save Looped Samples")
+		self.loop_button.setEnabled(False)
+		self.loop_button.clicked.connect(self.loop_selected_samples)
+		self.loop_cancel_button = QPushButton("Cancel")
+		self.loop_cancel_button.setEnabled(False)
+		self.loop_cancel_button.clicked.connect(self.cancel_worker)
+		self.loop_open_button = QPushButton("Open Looped Folder")
+		self.loop_open_button.setEnabled(False)
+		self.loop_open_button.clicked.connect(self.open_last_output)
+		buttons = QHBoxLayout()
+		buttons.addWidget(self.loop_button)
+		buttons.addWidget(self.loop_cancel_button)
+		buttons.addWidget(self.loop_open_button)
+		controls.addLayout(buttons)
+		controls.addStretch(1)
+
+		self.loop_progress = QProgressBar()
+		self.loop_log_output = QTextEdit()
+		self.loop_log_output.setReadOnly(True)
+		self.loop_log_output.setPlaceholderText("Looping logs will appear here.")
+		output_group = QGroupBox("Output")
+		output_layout = QVBoxLayout(output_group)
+		output_layout.addWidget(self.loop_progress)
+		output_layout.addWidget(self.loop_log_output, 1)
+		content.addWidget(output_group, 1)
+		return tab
+
+	def build_keyboard_tab(self) -> QWidget:
+		tab = QWidget()
+		layout = QVBoxLayout(tab)
+		layout.setContentsMargins(16, 14, 16, 14)
+		layout.setSpacing(12)
+		intro = QLabel("Test exported chromatic notes from your keyboard or by clicking a key. Select the folder that contains pitched_samples (or the exported WAV notes).")
+		intro.setWordWrap(True)
+		layout.addWidget(intro)
+
+		self.keyboard_folder_input = QLineEdit()
+		self.keyboard_folder_input.setReadOnly(True)
+		self.keyboard_folder_input.setPlaceholderText("Choose a chromatic or pitched_samples folder")
+		self.keyboard_folder_button = QPushButton("Choose Chromatic Folder")
+		self.keyboard_folder_button.clicked.connect(self.choose_keyboard_folder)
+		folder_row = QHBoxLayout()
+		folder_row.addWidget(self.keyboard_folder_input)
+		folder_row.addWidget(self.keyboard_folder_button)
+		layout.addLayout(folder_row)
+
+		self.keyboard_start_note_input = QComboBox()
+		self.keyboard_start_note_input.addItems(NOTES)
+		self.keyboard_start_note_input.setCurrentText("C")
+		self.keyboard_start_octave_input = QComboBox()
+		self.keyboard_start_octave_input.addItems(OCTAVES)
+		self.keyboard_start_octave_input.setCurrentText("2")
+		self.keyboard_start_note_input.currentTextChanged.connect(self.refresh_keyboard_labels)
+		self.keyboard_start_octave_input.currentTextChanged.connect(self.refresh_keyboard_labels)
+		self.keyboard_volume_input = QSlider(Qt.Horizontal)
+		self.keyboard_volume_input.setRange(0, 100)
+		self.keyboard_volume_input.setValue(80)
+		controls_group = QGroupBox("Keyboard Setup")
+		controls_form = QFormLayout(controls_group)
+		controls_form.addRow("First exported note:", self.keyboard_start_note_input)
+		controls_form.addRow("First exported octave:", self.keyboard_start_octave_input)
+		controls_form.addRow("Volume:", self.keyboard_volume_input)
+		layout.addWidget(controls_group)
+
+		self.keyboard_status_label = QLabel("Add a folder, then click a key. Physical keys cover two octaves: Z/S/X/D/C/V/G/B/H/N/J/M, then Q/2/W/3/E/R/5/T/6/Y/7/U.")
+		self.keyboard_status_label.setWordWrap(True)
+		layout.addWidget(self.keyboard_status_label)
+		keys_group = QGroupBox("Chromatic Test Keyboard")
+		keys_layout = QGridLayout(keys_group)
+		self.keyboard_buttons: list[QPushButton] = []
+		for offset in range(24):
+			button = QPushButton()
+			button.setMinimumHeight(58)
+			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_keyboard_note(note_offset))
+			keys_layout.addWidget(button, offset // 12, offset % 12)
+			self.keyboard_buttons.append(button)
+		layout.addWidget(keys_group)
+		piano_roll_group = QGroupBox("Piano Roll — click cells to add/remove notes")
+		piano_roll_layout = QVBoxLayout(piano_roll_group)
+		self.piano_roll = PianoRollView()
+		self.piano_roll.notes_changed.connect(self.update_piano_roll_status)
+		piano_roll_layout.addWidget(self.piano_roll)
+		self.piano_roll_bpm = QSpinBox()
+		self.piano_roll_bpm.setRange(40, 300)
+		self.piano_roll_bpm.setValue(120)
+		self.piano_roll_velocity = QSlider(Qt.Horizontal)
+		self.piano_roll_velocity.setRange(1, 127)
+		self.piano_roll_velocity.setValue(100)
+		self.piano_roll_record = QCheckBox("Record played keys into piano roll")
+		self.piano_roll_play_button = QPushButton("Play Pattern")
+		self.piano_roll_play_button.clicked.connect(self.toggle_piano_roll_playback)
+		self.piano_roll_clear_button = QPushButton("Clear Pattern")
+		self.piano_roll_clear_button.clicked.connect(self.piano_roll.clear_notes)
+		transport = QHBoxLayout()
+		transport.addWidget(QLabel("BPM:"))
+		transport.addWidget(self.piano_roll_bpm)
+		transport.addWidget(QLabel("Velocity:"))
+		transport.addWidget(self.piano_roll_velocity, 1)
+		transport.addWidget(self.piano_roll_record)
+		transport.addWidget(self.piano_roll_play_button)
+		transport.addWidget(self.piano_roll_clear_button)
+		piano_roll_layout.addLayout(transport)
+		layout.addWidget(piano_roll_group, 1)
+		self.keyboard_files: list[Path] = []
+		self.keyboard_sounds: dict[Path, QSoundEffect] = {}
+		self.keyboard_transport = QTimer(self)
+		self.keyboard_transport.timeout.connect(self.advance_piano_roll)
+		self.keyboard_step = 0
+		self.refresh_keyboard_labels()
+		return tab
+
+	def refresh_keyboard_labels(self, _unused: str = "") -> None:
+		if not hasattr(self, "keyboard_buttons"):
+			return
+		start_index = self.keyboard_start_note_input.currentIndex()
+		start_octave = int(self.keyboard_start_octave_input.currentText())
+		for offset, button in enumerate(self.keyboard_buttons):
+			button.setText(note_label(start_index, start_octave, offset))
+			button.setEnabled(bool(self.keyboard_files) and offset < len(self.keyboard_files))
+
+	def choose_keyboard_folder(self) -> None:
+		folder = QFileDialog.getExistingDirectory(self, "Choose chromatic or pitched_samples folder")
+		if not folder:
+			return
+		path = Path(folder)
+		# Selecting the generation folder is convenient; prefer its pitched export.
+		source_dir = path / "pitched_samples" if (path / "pitched_samples").is_dir() else path
+		self.keyboard_files = list_source_files(source_dir)
+		self.keyboard_sounds.clear()
+		self.keyboard_folder_input.setText(str(source_dir))
+		if self.keyboard_files:
+			self.keyboard_status_label.setText(f"Loaded {len(self.keyboard_files)} note file(s). Click a key or use the two-octave Z–M / Q–U key layout.")
+		else:
+			self.keyboard_status_label.setText("No note WAV files found. Generate with ‘Dump individual samples’ enabled, then choose its pitched_samples folder.")
+		self.refresh_keyboard_labels()
+
+	def play_keyboard_note(self, offset: int, velocity: float = 1.0, record: bool = True) -> None:
+		if offset >= len(self.keyboard_files):
+			return
+		path = self.keyboard_files[offset]
+		sound = self.keyboard_sounds.get(path)
+		if sound is None:
+			sound = QSoundEffect(self)
+			sound.setSource(QUrl.fromLocalFile(str(path)))
+			sound.setLoopCount(1)
+			self.keyboard_sounds[path] = sound
+		sound.setVolume(self.keyboard_volume_input.value() / 100.0 * float(np.clip(velocity, 0.0, 1.0)))
+		if record and self.piano_roll_record.isChecked():
+			self.piano_roll.add_note(self.keyboard_step, offset, self.piano_roll_velocity.value())
+		sound.stop()
+		sound.play()
+		self.keyboard_status_label.setText(f"Playing {self.keyboard_buttons[offset].text()} — {path.name}")
+
+	def update_piano_roll_status(self) -> None:
+		if hasattr(self, "piano_roll"):
+			self.keyboard_status_label.setText(f"Piano roll: {len(self.piano_roll.notes)} note(s). Click a cell to edit; Play Pattern to audition.")
+
+	def toggle_piano_roll_playback(self) -> None:
+		if self.keyboard_transport.isActive():
+			self.keyboard_transport.stop()
+			self.piano_roll.set_playhead(-1)
+			self.piano_roll_play_button.setText("Play Pattern")
+			return
+		self.keyboard_step = 0
+		self.keyboard_transport.setInterval(max(1, round(60000 / self.piano_roll_bpm.value() / 4)))
+		self.keyboard_transport.start()
+		self.piano_roll_play_button.setText("Stop Pattern")
+		self.advance_piano_roll()
+
+	def advance_piano_roll(self) -> None:
+		if not self.keyboard_transport.isActive():
+			return
+		self.piano_roll.set_playhead(self.keyboard_step)
+		for note in self.piano_roll.notes_at(self.keyboard_step):
+			self.play_keyboard_note(note.pitch, note.velocity / 127.0, record=False)
+		self.keyboard_step = (self.keyboard_step + 1) % self.piano_roll.steps
+
+	def keyPressEvent(self, event: QKeyEvent) -> None:
+		if self.tabs.currentIndex() in (2, 3) and not event.isAutoRepeat():
+			keys = (
+				Qt.Key.Key_Z, Qt.Key.Key_S, Qt.Key.Key_X, Qt.Key.Key_D, Qt.Key.Key_C, Qt.Key.Key_V,
+				Qt.Key.Key_G, Qt.Key.Key_B, Qt.Key.Key_H, Qt.Key.Key_N, Qt.Key.Key_J, Qt.Key.Key_M,
+				Qt.Key.Key_Q, Qt.Key.Key_2, Qt.Key.Key_W, Qt.Key.Key_3, Qt.Key.Key_E, Qt.Key.Key_R,
+				Qt.Key.Key_5, Qt.Key.Key_T, Qt.Key.Key_6, Qt.Key.Key_Y, Qt.Key.Key_7, Qt.Key.Key_U,
+			)
+			try:
+				offset = keys.index(event.key())
+			except ValueError:
+				pass
+			else:
+				if self.tabs.currentIndex() == 2:
+					self.play_loop_piano(offset)
+				else:
+					self.play_keyboard_note(offset)
+				event.accept()
+				return
+		super().keyPressEvent(event)
+
 	def system_theme_is_dark(self) -> bool:
 		scheme = QApplication.styleHints().colorScheme()
 		if scheme == Qt.ColorScheme.Dark:
@@ -990,6 +1852,9 @@ class GeneratorWindow(QMainWindow):
 		layout.addWidget(credits)
 		layout.addStretch(1)
 		return tab
+
+	def update_audio_style_description(self, style: str) -> None:
+		self.audio_style_description.setText(AUDIO_STYLES.get(style, ""))
 
 	def current_options(self) -> dict[str, object]:
 		return {
@@ -1107,10 +1972,19 @@ class GeneratorWindow(QMainWindow):
 		if path.is_dir():
 			if self.tabs.currentIndex() == 1:
 				self.set_prepare_sources(tuple(sorted(path.glob("*.wav"))), path / "prepared_samples")
+			elif self.tabs.currentIndex() == 2:
+				self.set_loop_sources(tuple(sorted(path.glob("*.wav"))), path / "looped_samples")
+			elif self.tabs.currentIndex() == 3:
+				source_dir = path / "pitched_samples" if (path / "pitched_samples").is_dir() else path
+				self.keyboard_files = list_source_files(source_dir)
+				self.keyboard_folder_input.setText(str(source_dir))
+				self.refresh_keyboard_labels()
 			else:
 				self.folder_input.setText(str(path))
 		elif path.suffix.lower() == ".wav" and self.tabs.currentIndex() == 1:
 			self.set_prepare_sources(tuple(Path(url.toLocalFile()) for url in urls), path.parent / "prepared_samples")
+		elif path.suffix.lower() == ".wav" and self.tabs.currentIndex() == 2:
+			self.set_loop_sources(tuple(Path(url.toLocalFile()) for url in urls), path.parent / "looped_samples")
 
 	def choose_folder(self) -> None:
 		folder = QFileDialog.getExistingDirectory(self, "Select sample folder")
@@ -1128,6 +2002,183 @@ class GeneratorWindow(QMainWindow):
 		if folder:
 			path = Path(folder)
 			self.set_prepare_sources(tuple(sorted(path.glob("*.wav"))), path / "prepared_samples")
+
+	def choose_loop_files(self) -> None:
+		files, _ = QFileDialog.getOpenFileNames(self, "Add WAV samples to loop", "", "WAV files (*.wav)")
+		if files:
+			paths = tuple(Path(path) for path in files)
+			self.set_loop_sources(paths, paths[0].parent / "looped_samples")
+
+	def choose_loop_folder(self) -> None:
+		folder = QFileDialog.getExistingDirectory(self, "Add a folder of WAV samples")
+		if folder:
+			path = Path(folder)
+			self.set_loop_sources(tuple(sorted(path.glob("*.wav"))), path / "looped_samples")
+
+	def set_loop_sources(self, paths: tuple[Path, ...], output_dir: Path) -> None:
+		self.loop_sources = tuple(path for path in paths if path.suffix.lower() == ".wav")
+		self.loop_output_dir = output_dir
+		if len(self.loop_sources) == 1:
+			self.loop_source_input.setText(str(self.loop_sources[0]))
+		else:
+			self.loop_source_input.setText(f"{len(self.loop_sources)} WAV file(s) -> {output_dir}")
+		self.loop_file_selector.blockSignals(True)
+		self.loop_file_selector.clear()
+		for path in self.loop_sources:
+			self.loop_file_selector.addItem(path.name, path)
+		self.loop_file_selector.blockSignals(False)
+		self.loop_preview_cache: dict[int, QSoundEffect] = {}
+		if self.loop_sources:
+			self.select_loop_source(0)
+		self.loop_button.setEnabled(bool(self.loop_sources) and self.worker is None)
+
+	def select_loop_source(self, index: int) -> None:
+		if index < 0 or index >= len(self.loop_sources):
+			return
+		try:
+			self.loop_preview_sound = load_mono(self.loop_sources[index], int(self.loop_sample_rate_input.currentText()))
+			if self.loop_trim_input.isChecked():
+				self.loop_preview_sound = trim_edge_silence(self.loop_preview_sound)
+		except Exception as error:
+			QMessageBox.warning(self, "ChromaKit", f"Could not load preview: {error}")
+			return
+		duration_ms = self.loop_preview_sound.xmax * 1000.0
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setMaximum(max(0.0, duration_ms - 0.01))
+		self.loop_end_input.setMaximum(duration_ms)
+		self.loop_start_input.setValue(0.0)
+		self.loop_end_input.setValue(duration_ms)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
+		self.loop_waveform.set_sound(self.loop_preview_sound)
+		self.loop_preview_cache = {}
+		self.update_loop_quality()
+
+	def update_loop_quality(self) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			return
+		sound = self.loop_preview_sound
+		start = int(round(self.loop_start_input.value() * sound.sampling_frequency / 1000.0))
+		end = int(round(self.loop_end_input.value() * sound.sampling_frequency / 1000.0))
+		window = min(max(8, int(self.loop_crossfade_input.value() * sound.sampling_frequency / 1000.0)), max(8, (end - start) // 3))
+		values = np.asarray(sound.values[0], dtype=np.float64)
+		if end - start <= window or start + window > len(values) or end > len(values):
+			self.loop_quality_label.setText("Seam quality: loop range is too short for the selected crossfade.")
+			return
+		head, tail = values[start:start + window], values[end - window:end]
+		scale = max(float(np.sqrt(np.mean(head * head))), float(np.sqrt(np.mean(tail * tail))), 1e-8)
+		error = float(np.mean(((head - tail) / scale) ** 2)) + float(abs(head[0] - tail[-1]) / scale)
+		score = int(np.clip(round(100.0 / (1.0 + 1.8 * error)), 0, 100))
+		grade = "excellent" if score >= 82 else "usable" if score >= 60 else "needs adjustment"
+		self.loop_quality_label.setText(f"Seam quality: {score}/100 ({grade}). Auto-detect finds a starting point; audition B repeatedly and adjust by ear.")
+
+	def on_loop_range_inputs_changed(self, _value: float) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			return
+		start = self.loop_start_input.value()
+		end = max(self.loop_end_input.value(), start + 0.01)
+		if self.loop_zero_snap_input.isChecked():
+			values = np.asarray(self.loop_preview_sound.values[0], dtype=np.float64)
+			radius = max(1, int(self.loop_preview_sound.sampling_frequency * 0.006))
+			start = snap_to_zero_crossing(values, int(start * self.loop_preview_sound.sampling_frequency / 1000.0), radius) * 1000.0 / self.loop_preview_sound.sampling_frequency
+			end = snap_to_zero_crossing(values, int(end * self.loop_preview_sound.sampling_frequency / 1000.0), radius) * 1000.0 / self.loop_preview_sound.sampling_frequency
+			end = max(end, start + 0.01)
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setValue(start)
+		self.loop_end_input.setValue(end)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
+		self.loop_waveform.set_range_ms(start, end)
+		self.loop_preview_cache = {}
+		self.update_loop_quality()
+
+	def on_loop_waveform_range_changed(self, start_ms: float, end_ms: float) -> None:
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setValue(start_ms)
+		self.loop_end_input.setValue(end_ms)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
+		self.loop_preview_cache = {}
+		self.update_loop_quality()
+
+	def auto_detect_loop(self) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			QMessageBox.information(self, "ChromaKit", "Add a WAV sample first.")
+			return
+		start, end = detect_best_loop_region(self.loop_preview_sound)
+		self.loop_start_input.setValue(start)
+		self.loop_end_input.setValue(end)
+		self.on_loop_range_inputs_changed(0.0)
+		self.statusBar().showMessage(f"Best loop region found: {start:.1f}–{end:.1f} ms", 6000)
+
+	def clear_loop_preview_cache(self, _value: int = 0) -> None:
+		self.loop_preview_cache = {}
+
+	def selected_loop_segment(self) -> parselmouth.Sound | None:
+		if not hasattr(self, "loop_preview_sound"):
+			return None
+		sound = self.loop_preview_sound
+		frames = sound.get_number_of_samples()
+		start = int(round(self.loop_start_input.value() * sound.sampling_frequency / 1000.0))
+		end = int(round(self.loop_end_input.value() * sound.sampling_frequency / 1000.0))
+		start = int(np.clip(start, 0, max(0, frames - 1)))
+		end = int(np.clip(end, start + 1, frames))
+		return parselmouth.Sound(sound.values[:, start:end], sound.sampling_frequency)
+
+	def selected_loop_sound(self) -> parselmouth.Sound | None:
+		segment = self.selected_loop_segment()
+		if segment is None:
+			return None
+		cycle = make_seamless_loop(
+			segment,
+			int(self.loop_crossfade_input.value()),
+			self.loop_crossfade_curve_input.currentText(),
+			self.loop_match_gain_input.isChecked(),
+		)
+		if self.loop_render_mode_input.currentText() == "Render exact duration":
+			return render_loop_duration(cycle, self.loop_render_length_input.value())
+		return cycle
+
+	def play_loop_preview(self, looped: bool) -> None:
+		sound = self.selected_loop_sound() if looped else self.selected_loop_segment()
+		if sound is None:
+			return
+		path = Path(tempfile.gettempdir()) / f"chromakit-loop-ab-{id(self)}-{'loop' if looped else 'source'}.wav"
+		sound.save(str(path), "WAV")
+		self.loop_ab_sound = QSoundEffect(self)
+		self.loop_ab_sound.setSource(QUrl.fromLocalFile(str(path)))
+		self.loop_ab_sound.setVolume(0.8)
+		# B repeats the final render twice to make the seam easy to judge; A is a
+		# one-shot of the unprocessed selected region.
+		self.loop_ab_sound.setLoopCount(2 if looped else 1)
+		self.loop_ab_sound.play()
+
+	def stop_loop_preview(self) -> None:
+		if hasattr(self, "loop_ab_sound"):
+			self.loop_ab_sound.stop()
+		for sound in getattr(self, "loop_preview_cache", {}).values():
+			sound.stop()
+
+	def play_loop_piano(self, note_offset: int) -> None:
+		looped = self.selected_loop_sound()
+		if looped is None:
+			return
+		# Cache each preview note after range changes. C4 starts the compact piano.
+		sound = self.loop_preview_cache.get(note_offset)
+		if sound is None:
+			preview = retune_with_praat(looped, note_frequency(0, 4, note_offset))
+			path = Path(tempfile.gettempdir()) / f"chromakit-loop-preview-{id(self)}-{note_offset}.wav"
+			preview.save(str(path), "WAV")
+			sound = QSoundEffect(self)
+			sound.setSource(QUrl.fromLocalFile(str(path)))
+			sound.setLoopCount(1)
+			self.loop_preview_cache[note_offset] = sound
+		sound.setVolume(0.8)
+		sound.stop()
+		sound.play()
 
 	def set_prepare_sources(self, paths: tuple[Path, ...], output_dir: Path) -> None:
 		self.prepare_sources = tuple(path for path in paths if path.suffix.lower() == ".wav")
@@ -1264,7 +2315,38 @@ class GeneratorWindow(QMainWindow):
 		self.save_autosaved_options()
 		self.start_worker(PrepareWorker(settings), "Preparing samples...")
 
-	def start_worker(self, worker: GenerationWorker | PrepareWorker, status: str) -> None:
+	def loop_selected_samples(self) -> None:
+		if not self.loop_sources:
+			QMessageBox.critical(self, "ChromaKit", "Add WAV samples or a folder first.")
+			return
+		output_dir = getattr(self, "loop_output_dir", self.loop_sources[0].parent / "looped_samples")
+		if output_dir.exists() and any(output_dir.glob("*_loop.wav")):
+			answer = QMessageBox.question(
+				self, "ChromaKit", "'looped_samples' already contains looped WAV files. Overwrite matching files?",
+				QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+			)
+			if answer != QMessageBox.Yes:
+				self.statusBar().showMessage("Looping cancelled.")
+				return
+		settings = LoopSettings(
+			source_paths=self.loop_sources,
+			output_dir=output_dir,
+			crossfade_ms=int(self.loop_crossfade_input.value()),
+			trim_silence=self.loop_trim_input.isChecked(),
+			output_sample_rate=int(self.loop_sample_rate_input.currentText()),
+			loop_start_ms=self.loop_start_input.value(),
+			loop_end_ms=self.loop_end_input.value(),
+			render_length_seconds=self.loop_render_length_input.value(),
+			render_mode=self.loop_render_mode_input.currentText(),
+			crossfade_curve=self.loop_crossfade_curve_input.currentText(),
+			match_loop_gain=self.loop_match_gain_input.isChecked(),
+		)
+		self.loop_log_output.clear()
+		self.loop_progress.setRange(0, max(1, len(self.loop_sources)))
+		self.loop_progress.setValue(0)
+		self.start_worker(LoopWorker(settings), "Creating seamless loops...")
+
+	def start_worker(self, worker: GenerationWorker | PrepareWorker | LoopWorker, status: str) -> None:
 		self.worker = worker
 		worker.log.connect(self.append_log)
 		worker.progress.connect(self.on_progress)
@@ -1306,12 +2388,20 @@ class GeneratorWindow(QMainWindow):
 			self.padding_input,
 			self.prepare_sample_rate_input,
 		)
-		for widget in [*generation_inputs, *prepare_inputs]:
+		loop_inputs: Iterable[QWidget] = (
+			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
+			self.loop_file_selector, self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
+			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_stop_button, self.loop_zero_snap_input, self.loop_render_mode_input, self.loop_render_length_input, self.loop_crossfade_curve_input, self.loop_match_gain_input,
+			*self.loop_piano_buttons,
+		)
+		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
 			widget.setEnabled(not busy)
 		self.cancel_button.setEnabled(busy)
 		self.prepare_cancel_button.setEnabled(busy)
 		self.generate_button.setEnabled(False if busy else self.generate_button.isEnabled())
 		self.prepare_button.setEnabled(False if busy else bool(self.prepare_sources))
+		self.loop_button.setEnabled(False if busy else bool(self.loop_sources))
+		self.loop_cancel_button.setEnabled(busy)
 
 	def cancel_worker(self) -> None:
 		if self.worker:
@@ -1319,7 +2409,12 @@ class GeneratorWindow(QMainWindow):
 			self.statusBar().showMessage("Cancelling...")
 
 	def append_log(self, message: str) -> None:
-		target = self.prepare_log_output if isinstance(self.worker, PrepareWorker) else self.log_output
+		if isinstance(self.worker, PrepareWorker):
+			target = self.prepare_log_output
+		elif isinstance(self.worker, LoopWorker):
+			target = self.loop_log_output
+		else:
+			target = self.log_output
 		target.append(message)
 		target.moveCursor(QTextCursor.End)
 
@@ -1328,6 +2423,9 @@ class GeneratorWindow(QMainWindow):
 		if isinstance(self.worker, PrepareWorker):
 			self.prepare_progress.setRange(0, total)
 			self.prepare_progress.setValue(done)
+		elif isinstance(self.worker, LoopWorker):
+			self.loop_progress.setRange(0, total)
+			self.loop_progress.setValue(done)
 		else:
 			self.progress.setRange(0, total)
 			self.progress.setValue(done)
@@ -1337,6 +2435,7 @@ class GeneratorWindow(QMainWindow):
 		self.last_output_path = Path(output)
 		self.open_output_button.setEnabled(True)
 		self.prepare_open_button.setEnabled(True)
+		self.loop_open_button.setEnabled(True)
 		self.statusBar().showMessage(f"Done: {output}", 8000)
 		QMessageBox.information(self, "ChromaKit", f"Created {output}")
 
@@ -1348,6 +2447,8 @@ class GeneratorWindow(QMainWindow):
 		self.statusBar().showMessage(message, 8000)
 		if isinstance(self.worker, PrepareWorker):
 			self.prepare_progress.setValue(0)
+		elif isinstance(self.worker, LoopWorker):
+			self.loop_progress.setValue(0)
 		else:
 			self.progress.setValue(0)
 
@@ -1356,6 +2457,7 @@ class GeneratorWindow(QMainWindow):
 		self.set_busy(False)
 		self.refresh_generation_validation()
 		self.prepare_button.setEnabled(bool(self.prepare_sources))
+		self.loop_button.setEnabled(bool(self.loop_sources))
 
 	def open_last_output(self) -> None:
 		if not self.last_output_path:
