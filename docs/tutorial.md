@@ -58,7 +58,7 @@ Use this if you have a long recording instead of clean short samples.
 Use the **Loop Samples** tab to turn one or more WAV files into repeatable samples:
 
 1. Click **Add WAV Samples** (or **Add Folder**) and choose the file to edit in **Preview sample**.
-2. Use the waveform’s green **Start** and orange **End** handles, or enter exact millisecond values. Enable **Snap handles to zero crossings** for click-resistant edits. **Auto-detect Best Loop** searches for a pair of points with matching waveform shape, value, and slope.
+2. Use the waveform’s green **Start** and orange **End** handles, or enter exact millisecond values. Enable **Snap handles to zero crossings** for click-resistant edits. **Auto-detect Best Loop** searches voiced regions for matching waveform shape, value, and slope, then refines around nearby zero crossings.
 3. Use **A: Play Selected Source** and **B: Play Seamless Loop** to compare the edit, then use the compact **Loop Preview Piano** to hear the loop across a chromatic octave. The first row of the computer-key layout also plays it.
 4. Set the seam **Crossfade**. The default 30 ms is a good starting point; longer values make a softer loop transition. Choose **Render exact duration** and set **Final rendered length** to make a held FNF note of an exact length; choose **Save one seamless cycle** when you want the loop cycle itself for a sampler.
 5. Click **Save Looped Samples**.

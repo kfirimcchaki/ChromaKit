@@ -139,6 +139,8 @@ class LoopSettings:
 	loop_end_ms: float
 	render_length_seconds: float
 	render_mode: str
+	crossfade_curve: str
+	match_loop_gain: bool
 
 
 @dataclass(frozen=True)
@@ -898,7 +900,9 @@ def prepare_samples(
 	return settings.output_dir
 
 
-def make_seamless_loop(sound: parselmouth.Sound, crossfade_ms: int) -> parselmouth.Sound:
+def make_seamless_loop(
+	sound: parselmouth.Sound, crossfade_ms: int, crossfade_curve: str = "Equal power", match_loop_gain: bool = True,
+) -> parselmouth.Sound:
 	"""Create a repeatable loop by wrapping and crossfading its tail into its head.
 
 	The last rendered sample becomes the sample immediately before the loop start,
@@ -915,9 +919,23 @@ def make_seamless_loop(sound: parselmouth.Sound, crossfade_ms: int) -> parselmou
 	# Begin after the head used at the seam.  The final blended frame therefore
 	# flows directly into output frame zero when the file repeats.
 	loop = values[:, crossfade:].copy()
-	fade_in = np.linspace(0.0, 1.0, crossfade, endpoint=True)
-	fade_out = 1.0 - fade_in
-	loop[:, -crossfade:] = values[:, -crossfade:] * fade_out + values[:, :crossfade] * fade_in
+	head = values[:, :crossfade]
+	tail = values[:, -crossfade:].copy()
+	if match_loop_gain:
+		head_rms = float(np.sqrt(np.mean(head * head)))
+		tail_rms = float(np.sqrt(np.mean(tail * tail)))
+		if head_rms > 1e-8 and tail_rms > 1e-8:
+			# A modest gain match prevents an audible loudness bump at a vowel loop
+			# without radically changing the character of a naturally fading sample.
+			tail *= float(np.clip(head_rms / tail_rms, 0.5, 2.0))
+	linear = np.linspace(0.0, 1.0, crossfade, endpoint=True)
+	if crossfade_curve == "Equal power":
+		fade_in = np.sin(linear * math.pi / 2.0)
+		fade_out = np.cos(linear * math.pi / 2.0)
+	else:
+		fade_in = linear
+		fade_out = 1.0 - linear
+	loop[:, -crossfade:] = tail * fade_out + head * fade_in
 	return parselmouth.Sound(np.clip(loop, -1.0, 1.0), sound.sampling_frequency)
 
 
@@ -933,36 +951,56 @@ def snap_to_zero_crossing(values: np.ndarray, frame: int, radius: int) -> int:
 
 
 def detect_best_loop_region(sound: parselmouth.Sound) -> tuple[float, float]:
-	"""Find a long loop with similar waveform and slope on both sides of its seam."""
+	"""Find and refine a voiced loop whose boundary has the lowest mismatch."""
 	mono = np.asarray(sound.values[0], dtype=np.float64)
 	frames = len(mono)
 	if frames < 16:
 		raise ValueError("Sample is too short to analyse for a loop.")
 	minimum = min(max(int(sound.sampling_frequency * 0.12), 8), max(2, frames // 3))
 	window = min(max(int(sound.sampling_frequency * 0.018), 8), max(4, frames // 12))
-	# Candidate locations are evenly distributed so analysis stays responsive for
-	# long recordings, while the final crossfade handles sub-sample imperfections.
-	points = np.unique(np.linspace(0, frames - 1, min(72, frames), dtype=int))
+	energy_floor = max(float(np.max(np.abs(mono))) * 0.045, 1e-6)
+
+	def score(start_frame: int, end_frame: int) -> float | None:
+		if end_frame - start_frame < minimum or start_frame < 0 or end_frame > frames:
+			return None
+		head = mono[start_frame:start_frame + window]
+		tail = mono[end_frame - window:end_frame]
+		if len(head) != window or len(tail) != window:
+			return None
+		head_rms = float(np.sqrt(np.mean(head * head)))
+		tail_rms = float(np.sqrt(np.mean(tail * tail)))
+		# FNF voice samples often have attacks and tails around a sustained vowel.
+		# Rejecting quiet regions keeps auto-detect from choosing silence as a loop.
+		if min(head_rms, tail_rms) < energy_floor:
+			return None
+		scale = max(head_rms, tail_rms, 1e-7)
+		shape_error = float(np.mean(((head - tail) / scale) ** 2))
+		slope_error = float(abs((head[1] - head[0]) - (tail[-1] - tail[-2])) / scale)
+		boundary_error = float(abs(head[0] - tail[-1]) / scale)
+		return shape_error + 0.35 * slope_error + 0.8 * boundary_error
+
+	# Coarse search finds matching voiced regions quickly, then a local search
+	# aligns each endpoint to a nearby zero crossing for a cleaner click-free seam.
+	points = np.unique(np.linspace(0, frames - 1, min(96, frames), dtype=int))
 	best: tuple[float, int, int] | None = None
-	for start in points:
-		for end in points:
-			if end - start < minimum or start + window >= frames or end < window:
-				continue
-			head = mono[start:start + window]
-			tail = mono[end - window:end]
-			if len(head) != window or len(tail) != window:
-				continue
-			scale = max(float(np.sqrt(np.mean(head * head))), float(np.sqrt(np.mean(tail * tail))), 1e-7)
-			shape_error = float(np.mean(((head - tail) / scale) ** 2))
-			slope_error = float(abs((head[1] - head[0]) - (tail[-1] - tail[-2])) / scale)
-			boundary_error = float(abs(head[0] - tail[-1]) / scale)
-			score = shape_error + 0.35 * slope_error + 0.8 * boundary_error
-			if best is None or score < best[0]:
-				best = (score, int(start), int(end))
+	for start_frame in points:
+		for end_frame in points:
+			value = score(int(start_frame), int(end_frame))
+			if value is not None and (best is None or value < best[0]):
+				best = (value, int(start_frame), int(end_frame))
 	if best is None:
 		return 0.0, frames * 1000.0 / sound.sampling_frequency
-	return best[1] * 1000.0 / sound.sampling_frequency, best[2] * 1000.0 / sound.sampling_frequency
 
+	radius = max(1, int(sound.sampling_frequency * 0.014))
+	refined = best
+	for start_delta in np.linspace(-radius, radius, 9, dtype=int):
+		for end_delta in np.linspace(-radius, radius, 9, dtype=int):
+			start_frame = snap_to_zero_crossing(mono, best[1] + int(start_delta), radius // 3)
+			end_frame = snap_to_zero_crossing(mono, best[2] + int(end_delta), radius // 3)
+			value = score(start_frame, end_frame)
+			if value is not None and value < refined[0]:
+				refined = (value, start_frame, end_frame)
+	return refined[1] * 1000.0 / sound.sampling_frequency, refined[2] * 1000.0 / sound.sampling_frequency
 
 def render_loop_duration(sound: parselmouth.Sound, duration_seconds: float) -> parselmouth.Sound:
 	"""Repeat a prepared seamless cycle to an exact exported note duration."""
@@ -996,7 +1034,9 @@ def loop_samples(
 		start = int(np.clip(round(settings.loop_start_ms * sound.sampling_frequency / 1000.0), 0, max(0, frames - 1)))
 		end = int(np.clip(round(settings.loop_end_ms * sound.sampling_frequency / 1000.0), start + 1, frames))
 		selected = parselmouth.Sound(np.asarray(sound.values[:, start:end], dtype=np.float64), sound.sampling_frequency)
-		looped = make_seamless_loop(selected, settings.crossfade_ms)
+		looped = make_seamless_loop(
+			selected, settings.crossfade_ms, settings.crossfade_curve, settings.match_loop_gain,
+		)
 		if settings.render_mode == "Render exact duration":
 			looped = render_loop_duration(looped, settings.render_length_seconds)
 		output = settings.output_dir / f"{source.stem}_loop.wav"
@@ -1432,8 +1472,15 @@ class GeneratorWindow(QMainWindow):
 		self.loop_crossfade_input.setValue(30)
 		self.loop_crossfade_input.setSuffix(" ms")
 		self.loop_crossfade_input.valueChanged.connect(self.clear_loop_preview_cache)
+		self.loop_crossfade_curve_input = QComboBox()
+		self.loop_crossfade_curve_input.addItems(["Equal power", "Linear"])
+		self.loop_crossfade_curve_input.currentTextChanged.connect(self.clear_loop_preview_cache)
+		self.loop_match_gain_input = QCheckBox("Match tail/head loudness at seam")
+		self.loop_match_gain_input.setChecked(True)
+		self.loop_match_gain_input.toggled.connect(self.clear_loop_preview_cache)
 		self.loop_trim_input = QCheckBox("Trim quiet edges before looping")
 		self.loop_trim_input.setChecked(True)
+		self.loop_trim_input.toggled.connect(lambda _checked: self.select_loop_source(self.loop_file_selector.currentIndex()))
 		self.loop_zero_snap_input = QCheckBox("Snap handles to zero crossings")
 		self.loop_zero_snap_input.setChecked(True)
 		self.loop_sample_rate_input = QComboBox()
@@ -1452,6 +1499,8 @@ class GeneratorWindow(QMainWindow):
 		loop_form.addRow("Loop end:", self.loop_end_input)
 		loop_form.addRow("", self.loop_auto_button)
 		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
+		loop_form.addRow("Crossfade curve:", self.loop_crossfade_curve_input)
+		loop_form.addRow("", self.loop_match_gain_input)
 		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
 		loop_form.addRow("Export mode:", self.loop_render_mode_input)
 		loop_form.addRow("Final rendered length:", self.loop_render_length_input)
@@ -1460,6 +1509,9 @@ class GeneratorWindow(QMainWindow):
 		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. Choose an exact final render length to create held FNF notes, or save one clean loop cycle for a sampler. The selected tail is crossfaded into its head to avoid a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
 		help_label.setWordWrap(True)
 		loop_form.addRow(help_label)
+		self.loop_quality_label = QLabel("Seam quality: choose a sample region to analyse.")
+		self.loop_quality_label.setWordWrap(True)
+		loop_form.addRow(self.loop_quality_label)
 		controls.addWidget(loop_group)
 		controls.addWidget(self.loop_waveform)
 		preview_group = QGroupBox("Loop Preview Piano")
@@ -1939,6 +1991,8 @@ class GeneratorWindow(QMainWindow):
 			return
 		try:
 			self.loop_preview_sound = load_mono(self.loop_sources[index], int(self.loop_sample_rate_input.currentText()))
+			if self.loop_trim_input.isChecked():
+				self.loop_preview_sound = trim_edge_silence(self.loop_preview_sound)
 		except Exception as error:
 			QMessageBox.warning(self, "ChromaKit", f"Could not load preview: {error}")
 			return
@@ -1953,6 +2007,25 @@ class GeneratorWindow(QMainWindow):
 		self.loop_end_input.blockSignals(False)
 		self.loop_waveform.set_sound(self.loop_preview_sound)
 		self.loop_preview_cache = {}
+		self.update_loop_quality()
+
+	def update_loop_quality(self) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			return
+		sound = self.loop_preview_sound
+		start = int(round(self.loop_start_input.value() * sound.sampling_frequency / 1000.0))
+		end = int(round(self.loop_end_input.value() * sound.sampling_frequency / 1000.0))
+		window = min(max(8, int(self.loop_crossfade_input.value() * sound.sampling_frequency / 1000.0)), max(8, (end - start) // 3))
+		values = np.asarray(sound.values[0], dtype=np.float64)
+		if end - start <= window or start + window > len(values) or end > len(values):
+			self.loop_quality_label.setText("Seam quality: loop range is too short for the selected crossfade.")
+			return
+		head, tail = values[start:start + window], values[end - window:end]
+		scale = max(float(np.sqrt(np.mean(head * head))), float(np.sqrt(np.mean(tail * tail))), 1e-8)
+		error = float(np.mean(((head - tail) / scale) ** 2)) + float(abs(head[0] - tail[-1]) / scale)
+		score = int(np.clip(round(100.0 / (1.0 + 1.8 * error)), 0, 100))
+		grade = "excellent" if score >= 82 else "usable" if score >= 60 else "needs adjustment"
+		self.loop_quality_label.setText(f"Seam quality: {score}/100 ({grade}). Auto-detect finds a starting point; audition B repeatedly and adjust by ear.")
 
 	def on_loop_range_inputs_changed(self, _value: float) -> None:
 		if not hasattr(self, "loop_preview_sound"):
@@ -1973,6 +2046,7 @@ class GeneratorWindow(QMainWindow):
 		self.loop_end_input.blockSignals(False)
 		self.loop_waveform.set_range_ms(start, end)
 		self.loop_preview_cache = {}
+		self.update_loop_quality()
 
 	def on_loop_waveform_range_changed(self, start_ms: float, end_ms: float) -> None:
 		self.loop_start_input.blockSignals(True)
@@ -1982,6 +2056,7 @@ class GeneratorWindow(QMainWindow):
 		self.loop_start_input.blockSignals(False)
 		self.loop_end_input.blockSignals(False)
 		self.loop_preview_cache = {}
+		self.update_loop_quality()
 
 	def auto_detect_loop(self) -> None:
 		if not hasattr(self, "loop_preview_sound"):
@@ -2011,7 +2086,12 @@ class GeneratorWindow(QMainWindow):
 		segment = self.selected_loop_segment()
 		if segment is None:
 			return None
-		cycle = make_seamless_loop(segment, int(self.loop_crossfade_input.value()))
+		cycle = make_seamless_loop(
+			segment,
+			int(self.loop_crossfade_input.value()),
+			self.loop_crossfade_curve_input.currentText(),
+			self.loop_match_gain_input.isChecked(),
+		)
 		if self.loop_render_mode_input.currentText() == "Render exact duration":
 			return render_loop_duration(cycle, self.loop_render_length_input.value())
 		return cycle
@@ -2212,6 +2292,8 @@ class GeneratorWindow(QMainWindow):
 			loop_end_ms=self.loop_end_input.value(),
 			render_length_seconds=self.loop_render_length_input.value(),
 			render_mode=self.loop_render_mode_input.currentText(),
+			crossfade_curve=self.loop_crossfade_curve_input.currentText(),
+			match_loop_gain=self.loop_match_gain_input.isChecked(),
 		)
 		self.loop_log_output.clear()
 		self.loop_progress.setRange(0, max(1, len(self.loop_sources)))
@@ -2263,7 +2345,7 @@ class GeneratorWindow(QMainWindow):
 		loop_inputs: Iterable[QWidget] = (
 			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
 			self.loop_file_selector, self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
-			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_stop_button, self.loop_zero_snap_input, self.loop_render_mode_input, self.loop_render_length_input,
+			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_stop_button, self.loop_zero_snap_input, self.loop_render_mode_input, self.loop_render_length_input, self.loop_crossfade_curve_input, self.loop_match_gain_input,
 			*self.loop_piano_buttons,
 		)
 		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
