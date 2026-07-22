@@ -37,7 +37,9 @@ Use this if you have a long recording instead of clean short samples.
 - **Sample gap**: silence between notes in `chromatic.wav`.
 - **Sample order**: how samples are picked.
 - **Pitch samples**: changes each sample to match the notes.
-- **Audio style → Formant corrected**: shifts pitch while keeping vocal formants in place, reducing the chipmunk effect. This is the default style.
+- **Audio style**: chooses the retuning character. **Formant corrected** is the clean default and preserves vocal formants.
+  - **Vocal strain** gradually adds a small formant lift, harmonic drive, and presence after a source sample is pitched more than four semitones upward.
+  - **Scream / belt** is the stronger version for aggressive high notes. It responds smoothly to the upward interval, so low notes remain clean. It works best with a clean, voiced vocal source; it is an audio effect, not AI voice generation.
 - **Dump individual samples**: saves separate WAV files too.
 - **Trim silence from samples**: cuts quiet edges from samples.
 - **Peak normalize before pitch**: makes sample volume more even.

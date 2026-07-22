@@ -50,7 +50,15 @@ AUDIO_STYLES = {
 	"OG App": "Original app pitch - Praat formula at 48 kHz",
 	"Praat": "Praat pitch - no low-note FFT fallback",
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
+	"Vocal strain": "Adds natural vocal effort gradually above the source pitch",
+	"Scream / belt": "A stronger high-note belt with drive and presence",
 }
+
+# Expressive styles start building effort only after a moderate upward shift.  This
+# leaves low notes clean and makes the effect follow the actual interval rather
+# than an arbitrary absolute octave.
+STRAIN_START_SEMITONES = 4.0
+STRAIN_FULL_SEMITONES = 19.0
 DEFAULT_SAMPLE_RATE = 48000
 LOW_NOTE_FFT_THRESHOLD = 60.0
 BRAND_CHROMA_COLOR = "#0D1524"
@@ -237,6 +245,10 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 		return retune_with_formant_correction(sound, target_frequency)
 	if audio_style == "Praat":
 		return retune_with_praat(sound, target_frequency)
+	if audio_style == "Vocal strain":
+		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.38)
+	if audio_style == "Scream / belt":
+		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.70)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -283,6 +295,87 @@ def retune_with_formant_correction(sound: parselmouth.Sound, target_frequency: f
 		1.0,
 		1.0,
 	)
+
+
+def estimated_voice_frequency(sound: parselmouth.Sound) -> float | None:
+	"""Return a conservative median F0 for interval-aware vocal styles."""
+	try:
+		pitch = parselmouth.praat.call(sound, "To Pitch", 0.0, 50.0, 900.0)
+		frequency = float(parselmouth.praat.call(pitch, "Get quantile", 0, 0, 0.5, "Hertz"))
+	except Exception:
+		return None
+	if not math.isfinite(frequency) or frequency <= 0:
+		return None
+	return frequency
+
+
+def vocal_effort_for_interval(source_frequency: float | None, target_frequency: float) -> float:
+	"""Map an upward pitch interval to a smooth 0--1 vocal-effort amount."""
+	if source_frequency is None or source_frequency <= 0 or target_frequency <= 0:
+		return 0.0
+	semitones = 12.0 * math.log2(target_frequency / source_frequency)
+	return float(np.clip(
+		(semitones - STRAIN_START_SEMITONES) / (STRAIN_FULL_SEMITONES - STRAIN_START_SEMITONES),
+		0.0,
+		1.0,
+	))
+
+
+def apply_vocal_drive(sound: parselmouth.Sound, effort: float, maximum_drive: float) -> parselmouth.Sound:
+	"""Add restrained harmonic drive and presence without changing note length.
+
+	This is deliberately a post-process, not generated noise: it retains the
+	speaker's articulation while a soft saturation and a little pre-emphasis make
+	high notes read more like a supported belt.  It cannot turn a non-vocal source
+	into a real human scream, but avoids a sudden/artificial switch at one note.
+	"""
+	amount = float(np.clip(effort * maximum_drive, 0.0, 0.85))
+	if amount <= 0:
+		return sound
+	values = np.asarray(sound.values, dtype=np.float64)
+	if values.size == 0:
+		return sound
+	peak = float(np.max(np.abs(values)))
+	if peak <= 1e-9:
+		return sound
+
+	# Level-independent soft clipping supplies upper harmonics.  Pre-emphasis is
+	# mixed in lightly to preserve the brighter, open quality of a high belt.
+	normalized = values / peak
+	drive = 1.0 + 5.0 * amount
+	saturated = np.tanh(normalized * drive) / math.tanh(drive)
+	previous = np.concatenate((normalized[:, :1], normalized[:, :-1]), axis=1)
+	presence = normalized - 0.90 * previous
+	presence_peak = float(np.max(np.abs(presence)))
+	if presence_peak > 1e-9:
+		presence /= presence_peak
+	mixed = (1.0 - amount) * normalized + amount * saturated + (0.13 * amount) * presence
+	# Keep the source peak (and therefore downstream normalization behavior) stable.
+	mixed_peak = max(float(np.max(np.abs(mixed))), 1e-9)
+	return parselmouth.Sound(np.clip(mixed * (peak / mixed_peak), -1.0, 1.0), sound.sampling_frequency)
+
+
+def retune_with_expressive_voice(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float,
+) -> parselmouth.Sound:
+	"""Pitch a voice and increase effort smoothly as the target goes higher."""
+	source_frequency = estimated_voice_frequency(sound)
+	effort = vocal_effort_for_interval(source_frequency, target_frequency)
+	pitch_floor = 37.5 if target_frequency < LOW_NOTE_FFT_THRESHOLD else 60.0
+	pitch_ceiling = 1200.0 if target_frequency < LOW_NOTE_FFT_THRESHOLD else 600.0
+	# Singers tend to raise formants slightly and use a wider pitch range as they
+	# belt.  The bounded values stay considerably subtler than chipmunk shifting.
+	retuned = parselmouth.praat.call(
+		sound,
+		"Change gender...",
+		pitch_floor,
+		pitch_ceiling,
+		1.0 + 0.16 * effort,
+		target_frequency,
+		1.0 + 0.30 * effort,
+		1.0,
+	)
+	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
 def retune_with_fft(sound: parselmouth.Sound, target_frequency: float) -> parselmouth.Sound | None:
@@ -726,6 +819,15 @@ class GeneratorWindow(QMainWindow):
 		self.gap_input.textChanged.connect(self.refresh_generation_validation)
 		self.order_input = QComboBox()
 		self.order_input.addItems(ORDER_MODES)
+		self.audio_style_input = QComboBox()
+		self.audio_style_input.addItems(list(AUDIO_STYLES))
+		self.audio_style_input.setCurrentText("Formant corrected")
+		self.audio_style_input.setToolTip("Choose how notes are retuned. Expressive styles react to the upward interval from each source sample.")
+		self.audio_style_description = QLabel()
+		self.audio_style_description.setWordWrap(True)
+		self.audio_style_description.setStyleSheet("color: palette(mid);")
+		self.audio_style_input.currentTextChanged.connect(self.update_audio_style_description)
+		self.update_audio_style_description(self.audio_style_input.currentText())
 
 		pitch_group = QGroupBox("Pitch and Range")
 		form = QFormLayout(pitch_group)
@@ -736,6 +838,8 @@ class GeneratorWindow(QMainWindow):
 		form.addRow("Range:", self.range_input)
 		form.addRow("Sample gap:", self.gap_input)
 		form.addRow("Sample order:", self.order_input)
+		form.addRow("Audio style:", self.audio_style_input)
+		form.addRow("", self.audio_style_description)
 		pitch_tab = QWidget()
 		pitch_tab_layout = QVBoxLayout(pitch_tab)
 		pitch_tab_layout.setContentsMargins(8, 8, 8, 8)
@@ -747,10 +851,6 @@ class GeneratorWindow(QMainWindow):
 		self.pitch_input.setChecked(True)
 		self.dump_input = QCheckBox("Dump individual samples")
 		self.dump_input.setChecked(True)
-		self.audio_style_input = QComboBox()
-		self.audio_style_input.addItems(list(AUDIO_STYLES))
-		self.audio_style_input.setCurrentText("Formant corrected")
-		self.audio_style_input.setToolTip("Choose the pitch processing style used while generating notes.")
 		self.trim_silence_input = QCheckBox("Trim silence from samples")
 		self.normalize_input = QCheckBox("Peak normalize before pitch")
 		self.slicex_input = QCheckBox("Embed FL Studio Slicex markers")
@@ -763,17 +863,15 @@ class GeneratorWindow(QMainWindow):
 		options = QGridLayout(options_group)
 		options.addWidget(self.pitch_input, 0, 0)
 		options.addWidget(self.dump_input, 0, 1)
-		options.addWidget(QLabel("Audio style:"), 1, 0)
-		options.addWidget(self.audio_style_input, 1, 1)
-		options.addWidget(self.trim_silence_input, 2, 0)
-		options.addWidget(self.normalize_input, 2, 1)
-		options.addWidget(self.slicex_input, 3, 0, 1, 2)
-		options.addWidget(QLabel("Fade in/out (ms):"), 4, 0)
-		options.addWidget(self.fade_input, 4, 1)
-		options.addWidget(QLabel("Fixed note length (s):"), 5, 0)
-		options.addWidget(self.fixed_length_input, 5, 1)
-		options.addWidget(QLabel("Output sample rate:"), 6, 0)
-		options.addWidget(self.sample_rate_input, 6, 1)
+		options.addWidget(self.trim_silence_input, 1, 0)
+		options.addWidget(self.normalize_input, 1, 1)
+		options.addWidget(self.slicex_input, 2, 0, 1, 2)
+		options.addWidget(QLabel("Fade in/out (ms):"), 3, 0)
+		options.addWidget(self.fade_input, 3, 1)
+		options.addWidget(QLabel("Fixed note length (s):"), 4, 0)
+		options.addWidget(self.fixed_length_input, 4, 1)
+		options.addWidget(QLabel("Output sample rate:"), 5, 0)
+		options.addWidget(self.sample_rate_input, 5, 1)
 		processing_tab = QWidget()
 		processing_tab_layout = QVBoxLayout(processing_tab)
 		processing_tab_layout.setContentsMargins(8, 8, 8, 8)
@@ -990,6 +1088,9 @@ class GeneratorWindow(QMainWindow):
 		layout.addWidget(credits)
 		layout.addStretch(1)
 		return tab
+
+	def update_audio_style_description(self, style: str) -> None:
+		self.audio_style_description.setText(AUDIO_STYLES.get(style, ""))
 
 	def current_options(self) -> dict[str, object]:
 		return {
