@@ -58,8 +58,8 @@ Use this if you have a long recording instead of clean short samples.
 Use the **Loop Samples** tab to turn one or more WAV files into repeatable samples:
 
 1. Click **Add WAV Samples** (or **Add Folder**) and choose the file to edit in **Preview sample**.
-2. Use the waveform’s green **Start** and orange **End** handles, or enter exact millisecond values. **Auto-detect Best Loop** searches for a pair of points with matching waveform shape, value, and slope.
-3. Use the compact **Loop Preview Piano** to hear the selected, crossfaded loop across a chromatic octave. The first row of the computer-key layout also plays it.
+2. Use the waveform’s green **Start** and orange **End** handles, or enter exact millisecond values. Enable **Snap handles to zero crossings** for click-resistant edits. **Auto-detect Best Loop** searches for a pair of points with matching waveform shape, value, and slope.
+3. Use **A: Play Selected Source** and **B: Play Seamless Loop** to compare the edit, then use the compact **Loop Preview Piano** to hear the loop across a chromatic octave. The first row of the computer-key layout also plays it.
 4. Set the seam **Crossfade**. The default 30 ms is a good starting point; longer values make a softer loop transition.
 5. Click **Save Looped Samples**.
 
@@ -68,4 +68,6 @@ ChromaKit trims optional quiet edges, applies the selected loop range, blends it
 
 ## Test a Chromatic with the Keyboard
 
-The **Keyboard** tab previews exported note WAVs without leaving ChromaKit. Choose the generation folder (the app automatically uses its `pitched_samples/` folder) or choose that folder directly. Set the first note to match the chromatic, then click any of the 24 note buttons. You can also use two physical-key rows: `Z S X D C V G B H N J M` and `Q 2 W 3 E R 5 T 6 Y 7 U`. Generate with **Dump individual samples** enabled before testing.
+The **Keyboard** tab previews exported note WAVs without leaving ChromaKit. Choose the generation folder (the app automatically uses its `pitched_samples/` folder) or choose that folder directly. Set the first note to match the chromatic, then click any of the 24 note buttons. You can also use two physical-key rows: `Z S X D C V G B H N J M` and `Q 2 W 3 E R 5 T 6 Y 7 U`.
+
+For an FL Studio-inspired audition workflow, use the **Piano Roll** below the playable keyboard: click cells to create/remove notes, set BPM and velocity, then use **Play Pattern**. Enable **Record played keys into piano roll** to capture notes from the keyboard at the current step. Generate with **Dump individual samples** enabled before testing.

@@ -14,7 +14,7 @@ from typing import Callable, Iterable, Sequence
 import numpy as np
 import parselmouth
 from PySide6.QtMultimedia import QSoundEffect
-from PySide6.QtCore import QSettings, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QSettings, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPainter, QPalette, QColor, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
 	QApplication,
@@ -222,6 +222,87 @@ class WaveformView(QWidget):
 
 	def mouseReleaseEvent(self, _event: object) -> None:
 		self._drag_marker = None
+
+
+@dataclass(frozen=True)
+class PianoRollNote:
+	step: int
+	pitch: int
+	velocity: int = 100
+
+
+class PianoRollView(QWidget):
+	"""A compact step piano-roll for auditioning an exported chromatic."""
+	notes_changed = Signal()
+
+	def __init__(self, steps: int = 16, pitches: int = 24) -> None:
+		super().__init__()
+		self.steps = steps
+		self.pitches = pitches
+		self.notes: dict[tuple[int, int], int] = {}
+		self.playhead = -1
+		self.setMinimumHeight(260)
+		self.setMinimumWidth(580)
+
+	def set_playhead(self, step: int) -> None:
+		self.playhead = step
+		self.update()
+
+	def clear_notes(self) -> None:
+		self.notes.clear()
+		self.update()
+		self.notes_changed.emit()
+
+	def add_note(self, step: int, pitch: int, velocity: int) -> None:
+		self.notes[(max(0, min(self.steps - 1, step)), max(0, min(self.pitches - 1, pitch)))] = velocity
+		self.update()
+		self.notes_changed.emit()
+
+	def notes_at(self, step: int) -> list[PianoRollNote]:
+		return [PianoRollNote(note_step, pitch, velocity) for (note_step, pitch), velocity in self.notes.items() if note_step == step]
+
+	def _cell_at(self, x: float, y: float) -> tuple[int, int]:
+		step = int(np.clip(x / max(1, self.width()) * self.steps, 0, self.steps - 1))
+		# Lowest note is drawn at the bottom, like a conventional piano roll.
+		pitch = self.pitches - 1 - int(np.clip(y / max(1, self.height()) * self.pitches, 0, self.pitches - 1))
+		return step, pitch
+
+	def mousePressEvent(self, event: object) -> None:
+		step, pitch = self._cell_at(event.position().x(), event.position().y())
+		key = (step, pitch)
+		if key in self.notes:
+			del self.notes[key]
+		else:
+			self.notes[key] = 100
+		self.update()
+		self.notes_changed.emit()
+
+	def paintEvent(self, _event: object) -> None:
+		painter = QPainter(self)
+		painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
+		width, height = max(1, self.width()), max(1, self.height())
+		cell_w, cell_h = width / self.steps, height / self.pitches
+		grid_pen = QPen(self.palette().color(QPalette.ColorRole.Mid), 1)
+		painter.setPen(grid_pen)
+		for step in range(self.steps + 1):
+			x = int(step * cell_w)
+			painter.drawLine(x, 0, x, height)
+		for pitch in range(self.pitches + 1):
+			y = int(pitch * cell_h)
+			painter.drawLine(0, y, width, y)
+		# Shade black-key lanes to make the grid read like a piano roll.
+		for pitch in range(self.pitches):
+			if NOTES[pitch % 12] in {"C#", "D#", "F#", "G#", "A#"}:
+				painter.fillRect(0, int((self.pitches - pitch - 1) * cell_h), width, max(1, int(cell_h)), QColor(0, 0, 0, 25))
+		for (step, pitch), velocity in self.notes.items():
+			y = int((self.pitches - pitch - 1) * cell_h)
+			color = QColor("#0A8CE6")
+			color.setAlpha(120 + int(velocity * 1.3))
+			painter.fillRect(int(step * cell_w) + 2, y + 2, max(1, int(cell_w) - 3), max(1, int(cell_h) - 3), color)
+		if 0 <= self.playhead < self.steps:
+			painter.setPen(QPen(QColor("#ff9f0a"), 2))
+			x = int(self.playhead * cell_w)
+			painter.drawLine(x, 0, x, height)
 
 
 class CancelledError(Exception):
@@ -810,6 +891,17 @@ def make_seamless_loop(sound: parselmouth.Sound, crossfade_ms: int) -> parselmou
 	return parselmouth.Sound(np.clip(loop, -1.0, 1.0), sound.sampling_frequency)
 
 
+def snap_to_zero_crossing(values: np.ndarray, frame: int, radius: int) -> int:
+	"""Choose the nearest low-amplitude sign crossing for a click-resistant edit."""
+	if len(values) < 2:
+		return frame
+	left, right = max(1, frame - radius), min(len(values) - 1, frame + radius)
+	candidates = [index for index in range(left, right + 1) if values[index - 1] * values[index] <= 0]
+	if not candidates:
+		return int(np.clip(frame, 0, len(values) - 1))
+	return min(candidates, key=lambda index: abs(values[index - 1]) + abs(values[index]) + abs(index - frame) * 1e-5)
+
+
 def detect_best_loop_region(sound: parselmouth.Sound) -> tuple[float, float]:
 	"""Find a long loop with similar waveform and slope on both sides of its seam."""
 	mono = np.asarray(sound.values[0], dtype=np.float64)
@@ -1299,6 +1391,8 @@ class GeneratorWindow(QMainWindow):
 		self.loop_crossfade_input.valueChanged.connect(self.clear_loop_preview_cache)
 		self.loop_trim_input = QCheckBox("Trim quiet edges before looping")
 		self.loop_trim_input.setChecked(True)
+		self.loop_zero_snap_input = QCheckBox("Snap handles to zero crossings")
+		self.loop_zero_snap_input.setChecked(True)
 		self.loop_sample_rate_input = QComboBox()
 		self.loop_sample_rate_input.addItems(SAMPLE_RATES)
 		loop_group = QGroupBox("Seamless Loop")
@@ -1310,6 +1404,7 @@ class GeneratorWindow(QMainWindow):
 		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
 		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
 		loop_form.addRow("", self.loop_trim_input)
+		loop_form.addRow("", self.loop_zero_snap_input)
 		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. The selected tail is crossfaded into its head, so each saved WAV can repeat without a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
 		help_label.setWordWrap(True)
 		loop_form.addRow(help_label)
@@ -1323,9 +1418,12 @@ class GeneratorWindow(QMainWindow):
 			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_loop_piano(note_offset))
 			preview_layout.addWidget(button, 0, offset)
 			self.loop_piano_buttons.append(button)
-		self.loop_play_source_button = QPushButton("Play Selected Loop")
-		self.loop_play_source_button.clicked.connect(lambda: self.play_loop_piano(0))
-		preview_layout.addWidget(self.loop_play_source_button, 1, 0, 1, 12)
+		self.loop_play_source_button = QPushButton("A: Play Selected Source")
+		self.loop_play_source_button.clicked.connect(lambda: self.play_loop_preview(looped=False))
+		self.loop_play_loop_button = QPushButton("B: Play Seamless Loop")
+		self.loop_play_loop_button.clicked.connect(lambda: self.play_loop_preview(looped=True))
+		preview_layout.addWidget(self.loop_play_source_button, 1, 0, 1, 6)
+		preview_layout.addWidget(self.loop_play_loop_button, 1, 6, 1, 6)
 		controls.addWidget(preview_group)
 
 		self.loop_button = QPushButton("Save Looped Samples")
@@ -1404,9 +1502,38 @@ class GeneratorWindow(QMainWindow):
 			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_keyboard_note(note_offset))
 			keys_layout.addWidget(button, offset // 12, offset % 12)
 			self.keyboard_buttons.append(button)
-		layout.addWidget(keys_group, 1)
+		layout.addWidget(keys_group)
+		piano_roll_group = QGroupBox("Piano Roll — click cells to add/remove notes")
+		piano_roll_layout = QVBoxLayout(piano_roll_group)
+		self.piano_roll = PianoRollView()
+		self.piano_roll.notes_changed.connect(self.update_piano_roll_status)
+		piano_roll_layout.addWidget(self.piano_roll)
+		self.piano_roll_bpm = QSpinBox()
+		self.piano_roll_bpm.setRange(40, 300)
+		self.piano_roll_bpm.setValue(120)
+		self.piano_roll_velocity = QSlider(Qt.Horizontal)
+		self.piano_roll_velocity.setRange(1, 127)
+		self.piano_roll_velocity.setValue(100)
+		self.piano_roll_record = QCheckBox("Record played keys into piano roll")
+		self.piano_roll_play_button = QPushButton("Play Pattern")
+		self.piano_roll_play_button.clicked.connect(self.toggle_piano_roll_playback)
+		self.piano_roll_clear_button = QPushButton("Clear Pattern")
+		self.piano_roll_clear_button.clicked.connect(self.piano_roll.clear_notes)
+		transport = QHBoxLayout()
+		transport.addWidget(QLabel("BPM:"))
+		transport.addWidget(self.piano_roll_bpm)
+		transport.addWidget(QLabel("Velocity:"))
+		transport.addWidget(self.piano_roll_velocity, 1)
+		transport.addWidget(self.piano_roll_record)
+		transport.addWidget(self.piano_roll_play_button)
+		transport.addWidget(self.piano_roll_clear_button)
+		piano_roll_layout.addLayout(transport)
+		layout.addWidget(piano_roll_group, 1)
 		self.keyboard_files: list[Path] = []
 		self.keyboard_sounds: dict[Path, QSoundEffect] = {}
+		self.keyboard_transport = QTimer(self)
+		self.keyboard_transport.timeout.connect(self.advance_piano_roll)
+		self.keyboard_step = 0
 		self.refresh_keyboard_labels()
 		return tab
 
@@ -1435,7 +1562,7 @@ class GeneratorWindow(QMainWindow):
 			self.keyboard_status_label.setText("No note WAV files found. Generate with ‘Dump individual samples’ enabled, then choose its pitched_samples folder.")
 		self.refresh_keyboard_labels()
 
-	def play_keyboard_note(self, offset: int) -> None:
+	def play_keyboard_note(self, offset: int, velocity: float = 1.0, record: bool = True) -> None:
 		if offset >= len(self.keyboard_files):
 			return
 		path = self.keyboard_files[offset]
@@ -1445,10 +1572,36 @@ class GeneratorWindow(QMainWindow):
 			sound.setSource(QUrl.fromLocalFile(str(path)))
 			sound.setLoopCount(1)
 			self.keyboard_sounds[path] = sound
-		sound.setVolume(self.keyboard_volume_input.value() / 100.0)
+		sound.setVolume(self.keyboard_volume_input.value() / 100.0 * float(np.clip(velocity, 0.0, 1.0)))
+		if record and self.piano_roll_record.isChecked():
+			self.piano_roll.add_note(self.keyboard_step, offset, self.piano_roll_velocity.value())
 		sound.stop()
 		sound.play()
 		self.keyboard_status_label.setText(f"Playing {self.keyboard_buttons[offset].text()} — {path.name}")
+
+	def update_piano_roll_status(self) -> None:
+		if hasattr(self, "piano_roll"):
+			self.keyboard_status_label.setText(f"Piano roll: {len(self.piano_roll.notes)} note(s). Click a cell to edit; Play Pattern to audition.")
+
+	def toggle_piano_roll_playback(self) -> None:
+		if self.keyboard_transport.isActive():
+			self.keyboard_transport.stop()
+			self.piano_roll.set_playhead(-1)
+			self.piano_roll_play_button.setText("Play Pattern")
+			return
+		self.keyboard_step = 0
+		self.keyboard_transport.setInterval(max(1, round(60000 / self.piano_roll_bpm.value() / 4)))
+		self.keyboard_transport.start()
+		self.piano_roll_play_button.setText("Stop Pattern")
+		self.advance_piano_roll()
+
+	def advance_piano_roll(self) -> None:
+		if not self.keyboard_transport.isActive():
+			return
+		self.piano_roll.set_playhead(self.keyboard_step)
+		for note in self.piano_roll.notes_at(self.keyboard_step):
+			self.play_keyboard_note(note.pitch, note.velocity / 127.0, record=False)
+		self.keyboard_step = (self.keyboard_step + 1) % self.piano_roll.steps
 
 	def keyPressEvent(self, event: QKeyEvent) -> None:
 		if self.tabs.currentIndex() in (2, 3) and not event.isAutoRepeat():
@@ -1751,10 +1904,18 @@ class GeneratorWindow(QMainWindow):
 			return
 		start = self.loop_start_input.value()
 		end = max(self.loop_end_input.value(), start + 0.01)
-		if end != self.loop_end_input.value():
-			self.loop_end_input.blockSignals(True)
-			self.loop_end_input.setValue(end)
-			self.loop_end_input.blockSignals(False)
+		if self.loop_zero_snap_input.isChecked():
+			values = np.asarray(self.loop_preview_sound.values[0], dtype=np.float64)
+			radius = max(1, int(self.loop_preview_sound.sampling_frequency * 0.006))
+			start = snap_to_zero_crossing(values, int(start * self.loop_preview_sound.sampling_frequency / 1000.0), radius) * 1000.0 / self.loop_preview_sound.sampling_frequency
+			end = snap_to_zero_crossing(values, int(end * self.loop_preview_sound.sampling_frequency / 1000.0), radius) * 1000.0 / self.loop_preview_sound.sampling_frequency
+			end = max(end, start + 0.01)
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setValue(start)
+		self.loop_end_input.setValue(end)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
 		self.loop_waveform.set_range_ms(start, end)
 		self.loop_preview_cache = {}
 
@@ -1774,13 +1935,13 @@ class GeneratorWindow(QMainWindow):
 		start, end = detect_best_loop_region(self.loop_preview_sound)
 		self.loop_start_input.setValue(start)
 		self.loop_end_input.setValue(end)
-		self.loop_waveform.set_range_ms(start, end)
+		self.on_loop_range_inputs_changed(0.0)
 		self.statusBar().showMessage(f"Best loop region found: {start:.1f}–{end:.1f} ms", 6000)
 
 	def clear_loop_preview_cache(self, _value: int = 0) -> None:
 		self.loop_preview_cache = {}
 
-	def selected_loop_sound(self) -> parselmouth.Sound | None:
+	def selected_loop_segment(self) -> parselmouth.Sound | None:
 		if not hasattr(self, "loop_preview_sound"):
 			return None
 		sound = self.loop_preview_sound
@@ -1789,7 +1950,24 @@ class GeneratorWindow(QMainWindow):
 		end = int(round(self.loop_end_input.value() * sound.sampling_frequency / 1000.0))
 		start = int(np.clip(start, 0, max(0, frames - 1)))
 		end = int(np.clip(end, start + 1, frames))
-		return make_seamless_loop(parselmouth.Sound(sound.values[:, start:end], sound.sampling_frequency), int(self.loop_crossfade_input.value()))
+		return parselmouth.Sound(sound.values[:, start:end], sound.sampling_frequency)
+
+	def selected_loop_sound(self) -> parselmouth.Sound | None:
+		segment = self.selected_loop_segment()
+		if segment is None:
+			return None
+		return make_seamless_loop(segment, int(self.loop_crossfade_input.value()))
+
+	def play_loop_preview(self, looped: bool) -> None:
+		sound = self.selected_loop_sound() if looped else self.selected_loop_segment()
+		if sound is None:
+			return
+		path = Path(tempfile.gettempdir()) / f"chromakit-loop-ab-{id(self)}-{'loop' if looped else 'source'}.wav"
+		sound.save(str(path), "WAV")
+		self.loop_ab_sound = QSoundEffect(self)
+		self.loop_ab_sound.setSource(QUrl.fromLocalFile(str(path)))
+		self.loop_ab_sound.setVolume(0.8)
+		self.loop_ab_sound.play()
 
 	def play_loop_piano(self, note_offset: int) -> None:
 		looped = self.selected_loop_sound()
@@ -2016,7 +2194,7 @@ class GeneratorWindow(QMainWindow):
 		loop_inputs: Iterable[QWidget] = (
 			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
 			self.loop_file_selector, self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
-			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button,
+			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button, self.loop_play_loop_button, self.loop_zero_snap_input,
 			*self.loop_piano_buttons,
 		)
 		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
