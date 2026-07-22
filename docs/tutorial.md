@@ -57,11 +57,13 @@ Use this if you have a long recording instead of clean short samples.
 
 Use the **Loop Samples** tab to turn one or more WAV files into repeatable samples:
 
-1. Click **Add WAV Samples** (or **Add Folder**).
-2. Set the seam **Crossfade**. The default 30 ms is a good starting point; longer values make a softer loop transition.
-3. Click **Save Looped Samples**.
+1. Click **Add WAV Samples** (or **Add Folder**) and choose the file to edit in **Preview sample**.
+2. Use the waveform’s green **Start** and orange **End** handles, or enter exact millisecond values. **Auto-detect Best Loop** searches for a pair of points with matching waveform shape, value, and slope.
+3. Use the compact **Loop Preview Piano** to hear the selected, crossfaded loop across a chromatic octave. The first row of the computer-key layout also plays it.
+4. Set the seam **Crossfade**. The default 30 ms is a good starting point; longer values make a softer loop transition.
+5. Click **Save Looped Samples**.
 
-ChromaKit trims optional quiet edges, blends each file’s tail into its head, and writes `<original-name>_loop.wav` files in a `looped_samples/` folder beside the source. The loop boundary lands on consecutive waveform samples, eliminating the hard boundary click when the file repeats.
+ChromaKit trims optional quiet edges, applies the selected loop range, blends its tail into its head, and writes `<original-name>_loop.wav` files in a `looped_samples/` folder beside the source. The loop boundary lands on consecutive waveform samples, eliminating the hard boundary click when the file repeats.
 
 
 ## Test a Chromatic with the Keyboard

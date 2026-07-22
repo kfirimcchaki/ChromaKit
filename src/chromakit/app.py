@@ -8,13 +8,14 @@ import random
 import struct
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import parselmouth
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtCore import QSettings, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPalette, QPixmap, QTextCursor
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPainter, QPalette, QColor, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
 	QApplication,
 	QCheckBox,
@@ -131,12 +132,95 @@ class LoopSettings:
 	crossfade_ms: int
 	trim_silence: bool
 	output_sample_rate: int
+	loop_start_ms: float
+	loop_end_ms: float
 
 
 @dataclass(frozen=True)
 class SliceMarker:
 	offset: int
 	label: str
+
+
+class WaveformView(QWidget):
+	"""A lightweight editable waveform with draggable loop-start/end markers."""
+	range_changed = Signal(float, float)
+
+	def __init__(self) -> None:
+		super().__init__()
+		self.setMinimumHeight(170)
+		self.values = np.empty(0, dtype=np.float64)
+		self.sample_rate = DEFAULT_SAMPLE_RATE
+		self.start_frame = 0
+		self.end_frame = 0
+		self._drag_marker: str | None = None
+
+	def set_sound(self, sound: parselmouth.Sound) -> None:
+		self.values = np.asarray(sound.values[0], dtype=np.float64)
+		self.sample_rate = int(sound.sampling_frequency)
+		self.start_frame = 0
+		self.end_frame = len(self.values)
+		self.update()
+
+	def set_range_ms(self, start_ms: float, end_ms: float, emit: bool = False) -> None:
+		frames = len(self.values)
+		if not frames:
+			return
+		self.start_frame = int(np.clip(round(start_ms * self.sample_rate / 1000.0), 0, frames - 1))
+		self.end_frame = int(np.clip(round(end_ms * self.sample_rate / 1000.0), self.start_frame + 1, frames))
+		self.update()
+		if emit:
+			self.range_changed.emit(self.start_frame * 1000.0 / self.sample_rate, self.end_frame * 1000.0 / self.sample_rate)
+
+	def _frame_at_x(self, x: float) -> int:
+		if not len(self.values):
+			return 0
+		return int(np.clip(round(x / max(1, self.width() - 1) * len(self.values)), 0, len(self.values)))
+
+	def paintEvent(self, _event: object) -> None:
+		painter = QPainter(self)
+		painter.fillRect(self.rect(), self.palette().color(QPalette.ColorRole.Base))
+		if not len(self.values):
+			painter.drawText(self.rect(), Qt.AlignCenter, "Select a WAV sample to view and adjust its loop region")
+			return
+		width, height = max(1, self.width()), max(1, self.height())
+		mid = height / 2
+		painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Mid), 1))
+		painter.drawLine(0, int(mid), width, int(mid))
+		painter.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 1))
+		for x in range(width):
+			left = int(x * len(self.values) / width)
+			right = max(left + 1, int((x + 1) * len(self.values) / width))
+			chunk = self.values[left:right]
+			low = mid - float(np.min(chunk)) * (height * 0.43)
+			high = mid - float(np.max(chunk)) * (height * 0.43)
+			painter.drawLine(x, int(low), x, int(high))
+		for frame, color, text in ((self.start_frame, "#35c759", "Start"), (self.end_frame, "#ff9f0a", "End")):
+			x = int(frame / len(self.values) * width)
+			painter.setPen(QPen(QColor(color), 2))
+			painter.drawLine(x, 0, x, height)
+			painter.drawText(x + 3, 15, text)
+
+	def mousePressEvent(self, event: object) -> None:
+		if not len(self.values):
+			return
+		frame = self._frame_at_x(event.position().x())
+		self._drag_marker = "start" if abs(frame - self.start_frame) <= abs(frame - self.end_frame) else "end"
+		self.mouseMoveEvent(event)
+
+	def mouseMoveEvent(self, event: object) -> None:
+		if self._drag_marker is None or not len(self.values):
+			return
+		frame = self._frame_at_x(event.position().x())
+		if self._drag_marker == "start":
+			self.start_frame = min(frame, self.end_frame - 1)
+		else:
+			self.end_frame = max(frame, self.start_frame + 1)
+		self.update()
+		self.range_changed.emit(self.start_frame * 1000.0 / self.sample_rate, self.end_frame * 1000.0 / self.sample_rate)
+
+	def mouseReleaseEvent(self, _event: object) -> None:
+		self._drag_marker = None
 
 
 class CancelledError(Exception):
@@ -731,6 +815,38 @@ def make_seamless_loop(sound: parselmouth.Sound, crossfade_ms: int) -> parselmou
 	return parselmouth.Sound(np.clip(loop, -1.0, 1.0), sound.sampling_frequency)
 
 
+def detect_best_loop_region(sound: parselmouth.Sound) -> tuple[float, float]:
+	"""Find a long loop with similar waveform and slope on both sides of its seam."""
+	mono = np.asarray(sound.values[0], dtype=np.float64)
+	frames = len(mono)
+	if frames < 16:
+		raise ValueError("Sample is too short to analyse for a loop.")
+	minimum = min(max(int(sound.sampling_frequency * 0.12), 8), max(2, frames // 3))
+	window = min(max(int(sound.sampling_frequency * 0.018), 8), max(4, frames // 12))
+	# Candidate locations are evenly distributed so analysis stays responsive for
+	# long recordings, while the final crossfade handles sub-sample imperfections.
+	points = np.unique(np.linspace(0, frames - 1, min(72, frames), dtype=int))
+	best: tuple[float, int, int] | None = None
+	for start in points:
+		for end in points:
+			if end - start < minimum or start + window >= frames or end < window:
+				continue
+			head = mono[start:start + window]
+			tail = mono[end - window:end]
+			if len(head) != window or len(tail) != window:
+				continue
+			scale = max(float(np.sqrt(np.mean(head * head))), float(np.sqrt(np.mean(tail * tail))), 1e-7)
+			shape_error = float(np.mean(((head - tail) / scale) ** 2))
+			slope_error = float(abs((head[1] - head[0]) - (tail[-1] - tail[-2])) / scale)
+			boundary_error = float(abs(head[0] - tail[-1]) / scale)
+			score = shape_error + 0.35 * slope_error + 0.8 * boundary_error
+			if best is None or score < best[0]:
+				best = (score, int(start), int(end))
+	if best is None:
+		return 0.0, frames * 1000.0 / sound.sampling_frequency
+	return best[1] * 1000.0 / sound.sampling_frequency, best[2] * 1000.0 / sound.sampling_frequency
+
+
 def loop_samples(
 	settings: LoopSettings,
 	on_progress: Callable[[int, int, str], None],
@@ -748,7 +864,11 @@ def loop_samples(
 		sound = load_mono(source, settings.output_sample_rate)
 		if settings.trim_silence:
 			sound = trim_edge_silence(sound)
-		looped = make_seamless_loop(sound, settings.crossfade_ms)
+		frames = sound.get_number_of_samples()
+		start = int(np.clip(round(settings.loop_start_ms * sound.sampling_frequency / 1000.0), 0, max(0, frames - 1)))
+		end = int(np.clip(round(settings.loop_end_ms * sound.sampling_frequency / 1000.0), start + 1, frames))
+		selected = parselmouth.Sound(np.asarray(sound.values[:, start:end], dtype=np.float64), sound.sampling_frequency)
+		looped = make_seamless_loop(selected, settings.crossfade_ms)
 		output = settings.output_dir / f"{source.stem}_loop.wav"
 		looped.save(str(output), "WAV")
 		on_log(f"  wrote {output.name}")
@@ -1161,23 +1281,57 @@ class GeneratorWindow(QMainWindow):
 		source_layout.addLayout(source_buttons)
 		controls.addWidget(source_group)
 
+		self.loop_file_selector = QComboBox()
+		self.loop_file_selector.currentIndexChanged.connect(self.select_loop_source)
+		self.loop_waveform = WaveformView()
+		self.loop_waveform.range_changed.connect(self.on_loop_waveform_range_changed)
+		self.loop_start_input = QDoubleSpinBox()
+		self.loop_start_input.setRange(0.0, 1_000_000.0)
+		self.loop_start_input.setDecimals(2)
+		self.loop_start_input.setSuffix(" ms")
+		self.loop_start_input.valueChanged.connect(self.on_loop_range_inputs_changed)
+		self.loop_end_input = QDoubleSpinBox()
+		self.loop_end_input.setRange(0.01, 1_000_000.0)
+		self.loop_end_input.setDecimals(2)
+		self.loop_end_input.setSuffix(" ms")
+		self.loop_end_input.valueChanged.connect(self.on_loop_range_inputs_changed)
+		self.loop_auto_button = QPushButton("Auto-detect Best Loop")
+		self.loop_auto_button.clicked.connect(self.auto_detect_loop)
 		self.loop_crossfade_input = QSpinBox()
 		self.loop_crossfade_input.setRange(1, 1000)
 		self.loop_crossfade_input.setValue(30)
 		self.loop_crossfade_input.setSuffix(" ms")
+		self.loop_crossfade_input.valueChanged.connect(self.clear_loop_preview_cache)
 		self.loop_trim_input = QCheckBox("Trim quiet edges before looping")
 		self.loop_trim_input.setChecked(True)
 		self.loop_sample_rate_input = QComboBox()
 		self.loop_sample_rate_input.addItems(SAMPLE_RATES)
 		loop_group = QGroupBox("Seamless Loop")
 		loop_form = QFormLayout(loop_group)
+		loop_form.addRow("Preview sample:", self.loop_file_selector)
+		loop_form.addRow("Loop start:", self.loop_start_input)
+		loop_form.addRow("Loop end:", self.loop_end_input)
+		loop_form.addRow("", self.loop_auto_button)
 		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
 		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
 		loop_form.addRow("", self.loop_trim_input)
-		help_label = QLabel("The tail is crossfaded into the head, so each saved WAV can repeat without a waveform jump at its boundary. Output is saved as <name>_loop.wav in looped_samples.")
+		help_label = QLabel("Drag the green Start and orange End markers on the waveform, enter exact milliseconds, or use Auto-detect. The selected tail is crossfaded into its head, so each saved WAV can repeat without a waveform jump. Output is saved as <name>_loop.wav in looped_samples.")
 		help_label.setWordWrap(True)
 		loop_form.addRow(help_label)
 		controls.addWidget(loop_group)
+		controls.addWidget(self.loop_waveform)
+		preview_group = QGroupBox("Loop Preview Piano")
+		preview_layout = QGridLayout(preview_group)
+		self.loop_piano_buttons: list[QPushButton] = []
+		for offset, name in enumerate(NOTES):
+			button = QPushButton(name)
+			button.clicked.connect(lambda _checked=False, note_offset=offset: self.play_loop_piano(note_offset))
+			preview_layout.addWidget(button, 0, offset)
+			self.loop_piano_buttons.append(button)
+		self.loop_play_source_button = QPushButton("Play Selected Loop")
+		self.loop_play_source_button.clicked.connect(lambda: self.play_loop_piano(0))
+		preview_layout.addWidget(self.loop_play_source_button, 1, 0, 1, 12)
+		controls.addWidget(preview_group)
 
 		self.loop_button = QPushButton("Save Looped Samples")
 		self.loop_button.setEnabled(False)
@@ -1302,7 +1456,7 @@ class GeneratorWindow(QMainWindow):
 		self.keyboard_status_label.setText(f"Playing {self.keyboard_buttons[offset].text()} — {path.name}")
 
 	def keyPressEvent(self, event: QKeyEvent) -> None:
-		if self.tabs.currentIndex() == 3 and not event.isAutoRepeat():
+		if self.tabs.currentIndex() in (2, 3) and not event.isAutoRepeat():
 			keys = (
 				Qt.Key.Key_Z, Qt.Key.Key_S, Qt.Key.Key_X, Qt.Key.Key_D, Qt.Key.Key_C, Qt.Key.Key_V,
 				Qt.Key.Key_G, Qt.Key.Key_B, Qt.Key.Key_H, Qt.Key.Key_N, Qt.Key.Key_J, Qt.Key.Key_M,
@@ -1314,7 +1468,10 @@ class GeneratorWindow(QMainWindow):
 			except ValueError:
 				pass
 			else:
-				self.play_keyboard_note(offset)
+				if self.tabs.currentIndex() == 2:
+					self.play_loop_piano(offset % 12)
+				else:
+					self.play_keyboard_note(offset)
 				event.accept()
 				return
 		super().keyPressEvent(event)
@@ -1564,7 +1721,98 @@ class GeneratorWindow(QMainWindow):
 			self.loop_source_input.setText(str(self.loop_sources[0]))
 		else:
 			self.loop_source_input.setText(f"{len(self.loop_sources)} WAV file(s) -> {output_dir}")
+		self.loop_file_selector.blockSignals(True)
+		self.loop_file_selector.clear()
+		for path in self.loop_sources:
+			self.loop_file_selector.addItem(path.name, path)
+		self.loop_file_selector.blockSignals(False)
+		self.loop_preview_cache: dict[int, QSoundEffect] = {}
+		if self.loop_sources:
+			self.select_loop_source(0)
 		self.loop_button.setEnabled(bool(self.loop_sources) and self.worker is None)
+
+	def select_loop_source(self, index: int) -> None:
+		if index < 0 or index >= len(self.loop_sources):
+			return
+		try:
+			self.loop_preview_sound = load_mono(self.loop_sources[index], int(self.loop_sample_rate_input.currentText()))
+		except Exception as error:
+			QMessageBox.warning(self, "ChromaKit", f"Could not load preview: {error}")
+			return
+		duration_ms = self.loop_preview_sound.xmax * 1000.0
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setMaximum(max(0.0, duration_ms - 0.01))
+		self.loop_end_input.setMaximum(duration_ms)
+		self.loop_start_input.setValue(0.0)
+		self.loop_end_input.setValue(duration_ms)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
+		self.loop_waveform.set_sound(self.loop_preview_sound)
+		self.loop_preview_cache = {}
+
+	def on_loop_range_inputs_changed(self, _value: float) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			return
+		start = self.loop_start_input.value()
+		end = max(self.loop_end_input.value(), start + 0.01)
+		if end != self.loop_end_input.value():
+			self.loop_end_input.blockSignals(True)
+			self.loop_end_input.setValue(end)
+			self.loop_end_input.blockSignals(False)
+		self.loop_waveform.set_range_ms(start, end)
+		self.loop_preview_cache = {}
+
+	def on_loop_waveform_range_changed(self, start_ms: float, end_ms: float) -> None:
+		self.loop_start_input.blockSignals(True)
+		self.loop_end_input.blockSignals(True)
+		self.loop_start_input.setValue(start_ms)
+		self.loop_end_input.setValue(end_ms)
+		self.loop_start_input.blockSignals(False)
+		self.loop_end_input.blockSignals(False)
+		self.loop_preview_cache = {}
+
+	def auto_detect_loop(self) -> None:
+		if not hasattr(self, "loop_preview_sound"):
+			QMessageBox.information(self, "ChromaKit", "Add a WAV sample first.")
+			return
+		start, end = detect_best_loop_region(self.loop_preview_sound)
+		self.loop_start_input.setValue(start)
+		self.loop_end_input.setValue(end)
+		self.loop_waveform.set_range_ms(start, end)
+		self.statusBar().showMessage(f"Best loop region found: {start:.1f}–{end:.1f} ms", 6000)
+
+	def clear_loop_preview_cache(self, _value: int = 0) -> None:
+		self.loop_preview_cache = {}
+
+	def selected_loop_sound(self) -> parselmouth.Sound | None:
+		if not hasattr(self, "loop_preview_sound"):
+			return None
+		sound = self.loop_preview_sound
+		frames = sound.get_number_of_samples()
+		start = int(round(self.loop_start_input.value() * sound.sampling_frequency / 1000.0))
+		end = int(round(self.loop_end_input.value() * sound.sampling_frequency / 1000.0))
+		start = int(np.clip(start, 0, max(0, frames - 1)))
+		end = int(np.clip(end, start + 1, frames))
+		return make_seamless_loop(parselmouth.Sound(sound.values[:, start:end], sound.sampling_frequency), int(self.loop_crossfade_input.value()))
+
+	def play_loop_piano(self, note_offset: int) -> None:
+		looped = self.selected_loop_sound()
+		if looped is None:
+			return
+		# Cache each preview note after range changes. C4 starts the compact piano.
+		sound = self.loop_preview_cache.get(note_offset)
+		if sound is None:
+			preview = retune_with_praat(looped, note_frequency(0, 4, note_offset))
+			path = Path(tempfile.gettempdir()) / f"chromakit-loop-preview-{id(self)}-{note_offset}.wav"
+			preview.save(str(path), "WAV")
+			sound = QSoundEffect(self)
+			sound.setSource(QUrl.fromLocalFile(str(path)))
+			sound.setLoopCount(1)
+			self.loop_preview_cache[note_offset] = sound
+		sound.setVolume(0.8)
+		sound.stop()
+		sound.play()
 
 	def set_prepare_sources(self, paths: tuple[Path, ...], output_dir: Path) -> None:
 		self.prepare_sources = tuple(path for path in paths if path.suffix.lower() == ".wav")
@@ -1720,6 +1968,8 @@ class GeneratorWindow(QMainWindow):
 			crossfade_ms=int(self.loop_crossfade_input.value()),
 			trim_silence=self.loop_trim_input.isChecked(),
 			output_sample_rate=int(self.loop_sample_rate_input.currentText()),
+			loop_start_ms=self.loop_start_input.value(),
+			loop_end_ms=self.loop_end_input.value(),
 		)
 		self.loop_log_output.clear()
 		self.loop_progress.setRange(0, max(1, len(self.loop_sources)))
@@ -1770,7 +2020,9 @@ class GeneratorWindow(QMainWindow):
 		)
 		loop_inputs: Iterable[QWidget] = (
 			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
-			self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
+			self.loop_file_selector, self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
+			self.loop_start_input, self.loop_end_input, self.loop_auto_button, self.loop_play_source_button,
+			*self.loop_piano_buttons,
 		)
 		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
 			widget.setEnabled(not busy)
