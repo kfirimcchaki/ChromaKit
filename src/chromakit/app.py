@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Sequence
 
 import numpy as np
 import parselmouth
+from pedalboard import Compressor, HighShelfFilter, HighpassFilter, Limiter, Pedalboard
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtCore import QSettings, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QFont, QFontDatabase, QIcon, QKeyEvent, QPainter, QPalette, QColor, QPen, QPixmap, QTextCursor
@@ -55,9 +56,10 @@ AUDIO_STYLES = {
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
 	"Vocal strain": "Formant-aware, restrained vocal effort for upward notes",
 	"Bright belt": "Praat pitch with bright, supported high-note presence",
-	"Yell / shout": "Natural-formant high-note shout that grows with pitch",
-	"Scream / belt": "Natural-formant scream and belt for high notes",
-	"Rasp": "Clean, human-style vocal rasp without synthetic flutter",
+	"Yell / shout": "Formant-aware shout with studio vocal dynamics",
+	"Vocal impact": "Controlled high-note intensity with polished vocal compression",
+	"Scream / belt": "Formant-aware belt with studio dynamics and protected peaks",
+	"Rasp": "Clean vocal grit without synthetic flutter",
 }
 
 # Expressive styles start building effort only after a moderate upward shift.  This
@@ -431,11 +433,13 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 	if audio_style == "Bright belt":
 		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.34)
 	if audio_style == "Yell / shout":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.42)
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.36, intensity=0.55)
+	if audio_style == "Vocal impact":
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.44, intensity=0.75)
 	if audio_style == "Scream / belt":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.58)
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.52, intensity=1.0)
 	if audio_style == "Rasp":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.46)
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.40, intensity=0.68)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -564,14 +568,38 @@ def retune_with_expressive_voice(
 	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
-def retune_with_human_scream(sound: parselmouth.Sound, target_frequency: float, maximum_drive: float) -> parselmouth.Sound:
-	"""Use the higher-quality formant-aware path for human-style yells and screams.
+def apply_studio_vocal_finish(sound: parselmouth.Sound, effort: float, intensity: float) -> parselmouth.Sound:
+	"""Use a transparent studio dynamics chain after formant-aware resynthesis.
 
-	Real vocal fry/rasp cannot be recovered from a clean sample by adding a fixed
-	modulator.  This keeps the source's own vocal detail, shifts formants only as
-	the note climbs, and applies restrained harmonic compression instead.
+	A scream effect sounds artificial when it is mostly distortion or LFO flutter.
+	This chain instead controls peaks, removes unnecessary low rumble, and adds a
+	bounded presence lift that only arrives as the singer is pushed higher.
 	"""
-	return retune_with_expressive_voice(sound, target_frequency, maximum_drive)
+	amount = float(np.clip(effort * intensity, 0.0, 1.0))
+	if amount <= 0:
+		return sound
+	board = Pedalboard([
+		HighpassFilter(cutoff_frequency_hz=65.0),
+		Compressor(threshold_db=-18.0 + 4.0 * (1.0 - amount), ratio=1.3 + 1.7 * amount, attack_ms=8.0, release_ms=90.0),
+		HighShelfFilter(cutoff_frequency_hz=2400.0, gain_db=1.0 + 3.0 * amount, q=0.8),
+		Limiter(threshold_db=-1.0, release_ms=80.0),
+	])
+	processed = board(np.asarray(sound.values, dtype=np.float32), sound.sampling_frequency)
+	return parselmouth.Sound(np.clip(np.asarray(processed, dtype=np.float64), -1.0, 1.0), sound.sampling_frequency)
+
+
+def retune_with_human_scream(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, intensity: float,
+) -> parselmouth.Sound:
+	"""A vocal-preserving high-note style with a polished dynamics finish.
+
+	It intentionally does not invent buzz or random noise. The source voice supplies
+	the rasp; formant-aware retuning, gentle drive, compression, and peak limiting
+	make the rising note feel supported without destroying intelligibility.
+	"""
+	retuned = retune_with_expressive_voice(sound, target_frequency, maximum_drive)
+	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
+	return apply_studio_vocal_finish(retuned, effort, intensity)
 
 
 def retune_with_praat_expression(

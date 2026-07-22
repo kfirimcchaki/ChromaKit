@@ -1,4 +1,5 @@
 numpy
 praat-parselmouth
+pedalboard>=0.9.0
 PySide6
 pyinstaller
