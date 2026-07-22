@@ -56,9 +56,10 @@ AUDIO_STYLES = {
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
 	"Vocal strain": "Formant-aware, restrained vocal effort for upward notes",
 	"Bright belt": "Praat pitch with bright, supported high-note presence",
-	"Yell / shout": "Formant-aware shout with studio vocal dynamics",
-	"Vocal impact": "Controlled high-note intensity with polished vocal compression",
-	"Scream / belt": "Formant-aware belt with studio dynamics and protected peaks",
+	"Yell / shout": "Stable high-note shout; lower notes stay clean and level-matched",
+	"Vocal impact": "Controlled high-note intensity with matched output loudness",
+	"Scream / belt": "Stable formant-aware belt with protected peaks and matched loudness",
+	"Ultimate yell / scream": "Highest-quality stable scream: clean lows, controlled high-note power",
 	"Rasp": "Clean vocal grit without synthetic flutter",
 }
 
@@ -435,13 +436,15 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 	if audio_style == "Bright belt":
 		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.34)
 	if audio_style == "Yell / shout":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.36, intensity=0.55)
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.26, intensity=0.45)
 	if audio_style == "Vocal impact":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.44, intensity=0.75)
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.32, intensity=0.65)
 	if audio_style == "Scream / belt":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.52, intensity=1.0)
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.38, intensity=0.82)
+	if audio_style == "Ultimate yell / scream":
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.42, intensity=1.0)
 	if audio_style == "Rasp":
-		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.40, intensity=0.68)
+		return retune_with_ultimate_vocal(sound, target_frequency, maximum_drive=0.28, intensity=0.58)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -570,6 +573,32 @@ def retune_with_expressive_voice(
 	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
+def match_output_loudness(reference: parselmouth.Sound, rendered: parselmouth.Sound) -> parselmouth.Sound:
+	"""Keep expressive processing from making one chromatic note jump in volume."""
+	reference_values = np.asarray(reference.values, dtype=np.float64)
+	rendered_values = np.asarray(rendered.values, dtype=np.float64)
+	if reference_values.size == 0 or rendered_values.size == 0:
+		return rendered
+	# RMS is calculated only over audible frames, so trailing silence does not
+	# make the compensation explode. Restricting gain prevents small analysis
+	# errors from turning a vocal into a pumping/compressed note.
+	reference_active = reference_values[np.abs(reference_values) > 1e-4]
+	rendered_active = rendered_values[np.abs(rendered_values) > 1e-4]
+	if not reference_active.size or not rendered_active.size:
+		return rendered
+	reference_rms = float(np.sqrt(np.mean(reference_active * reference_active)))
+	rendered_rms = float(np.sqrt(np.mean(rendered_active * rendered_active)))
+	if reference_rms <= 1e-8 or rendered_rms <= 1e-8:
+		return rendered
+	gain = float(np.clip(reference_rms / rendered_rms, 0.72, 1.38))
+	reference_peak = float(np.max(np.abs(reference_values)))
+	adjusted = rendered_values * gain
+	adjusted_peak = float(np.max(np.abs(adjusted)))
+	if adjusted_peak > max(reference_peak, 1e-8):
+		adjusted *= reference_peak / adjusted_peak
+	return parselmouth.Sound(np.clip(adjusted, -1.0, 1.0), rendered.sampling_frequency)
+
+
 def apply_studio_vocal_finish(sound: parselmouth.Sound, effort: float, intensity: float) -> parselmouth.Sound:
 	"""Use a transparent studio dynamics chain after formant-aware resynthesis.
 
@@ -587,7 +616,8 @@ def apply_studio_vocal_finish(sound: parselmouth.Sound, effort: float, intensity
 		Limiter(threshold_db=-1.0, release_ms=80.0),
 	])
 	processed = board(np.asarray(sound.values, dtype=np.float32), sound.sampling_frequency)
-	return parselmouth.Sound(np.clip(np.asarray(processed, dtype=np.float64), -1.0, 1.0), sound.sampling_frequency)
+	rendered = parselmouth.Sound(np.clip(np.asarray(processed, dtype=np.float64), -1.0, 1.0), sound.sampling_frequency)
+	return match_output_loudness(sound, rendered)
 
 
 def retune_with_human_scream(
@@ -602,6 +632,22 @@ def retune_with_human_scream(
 	retuned = retune_with_expressive_voice(sound, target_frequency, maximum_drive)
 	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
 	return apply_studio_vocal_finish(retuned, effort, intensity)
+
+
+def retune_with_ultimate_vocal(
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, intensity: float,
+) -> parselmouth.Sound:
+	"""Stable scream/yell processing designed for a complete FNF chromatic range."""
+	source_frequency = estimated_voice_frequency(sound)
+	effort = vocal_effort_for_interval(source_frequency, target_frequency)
+	# The old styles ran the aggressive chain on every note. Below the strain
+	# threshold that produces bouncy low notes and inconsistent volume, so use
+	# the stable formant-corrected renderer with no color processing instead.
+	if effort < 0.035:
+		return retune_with_formant_correction(sound, target_frequency)
+	retuned = retune_with_expressive_voice(sound, target_frequency, maximum_drive)
+	finished = apply_studio_vocal_finish(retuned, effort, intensity)
+	return match_output_loudness(retuned, finished)
 
 
 def retune_with_praat_expression(

@@ -39,7 +39,7 @@ Use this if you have a long recording instead of clean short samples.
 - **Pitch samples**: changes each sample to match the notes.
 - **Audio style**: chooses the retuning character. **Formant corrected** is the clean default and preserves vocal formants.
   - **Vocal strain** gradually adds a small formant lift, harmonic drive, and presence after a source sample is pitched more than four semitones upward.
-  - **Bright belt** keeps the direct **Praat** pitch-resynthesis character. **Yell / shout**, **Vocal impact**, **Scream / belt**, and **Rasp** use the cleaner formant-aware vocal path plus a studio dynamics stage: high-pass cleanup, restrained compression, a bounded presence shelf, and peak limiting. Rasp deliberately avoids synthetic flutter, which can sound metallic or noisy. These styles work best with a clean, voiced vocal source; they are audio effects, not AI voice generation.
+  - **Bright belt** keeps the direct **Praat** pitch-resynthesis character. **Yell / shout**, **Vocal impact**, **Scream / belt**, **Ultimate yell / scream**, and **Rasp** keep lower notes on the stable formant-corrected path, then introduce vocal color only when the source is pushed upward. Their studio stage uses high-pass cleanup, restrained compression, a bounded presence shelf, peak limiting, and post-processing loudness matching so individual notes do not jump in level. Rasp deliberately avoids synthetic flutter, which can sound metallic or noisy. These styles work best with a clean, voiced vocal source; they are audio effects, not AI voice generation.
 - **Dump individual samples**: saves separate WAV files too.
 - **Trim silence from samples**: cuts quiet edges from samples.
 - **Peak normalize before pitch**: makes sample volume more even.
