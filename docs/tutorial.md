@@ -52,3 +52,13 @@ Use this if you have a long recording instead of clean short samples.
 - Try shorter, cleaner samples.
 - If **Prepare Samples** finds nothing, lower the silence threshold, for example from `-40 dB` to `-50 dB`.
 - If the output sounds messy, try fewer samples first.
+
+## Loop Samples
+
+Use the **Loop Samples** tab to turn one or more WAV files into repeatable samples:
+
+1. Click **Add WAV Samples** (or **Add Folder**).
+2. Set the seam **Crossfade**. The default 30 ms is a good starting point; longer values make a softer loop transition.
+3. Click **Save Looped Samples**.
+
+ChromaKit trims optional quiet edges, blends each file’s tail into its head, and writes `<original-name>_loop.wav` files in a `looped_samples/` folder beside the source. The loop boundary lands on consecutive waveform samples, eliminating the hard boundary click when the file repeats.

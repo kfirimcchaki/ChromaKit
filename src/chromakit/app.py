@@ -121,6 +121,15 @@ class PrepareSettings:
 
 
 @dataclass(frozen=True)
+class LoopSettings:
+	source_paths: tuple[Path, ...]
+	output_dir: Path
+	crossfade_ms: int
+	trim_silence: bool
+	output_sample_rate: int
+
+
+@dataclass(frozen=True)
 class SliceMarker:
 	offset: int
 	label: str
@@ -663,6 +672,55 @@ def prepare_samples(
 	return settings.output_dir
 
 
+def make_seamless_loop(sound: parselmouth.Sound, crossfade_ms: int) -> parselmouth.Sound:
+	"""Create a repeatable loop by wrapping and crossfading its tail into its head.
+
+	The last rendered sample becomes the sample immediately before the loop start,
+	so consecutive plays meet without a discontinuity (the usual source of clicks).
+	"""
+	values = np.asarray(sound.values, dtype=np.float64)
+	if values.ndim == 1:
+		values = values.reshape(1, -1)
+	frames = values.shape[1]
+	if frames < 4:
+		raise ValueError("A sample needs at least four frames to be looped.")
+	crossfade = int(round(crossfade_ms * sound.sampling_frequency / 1000.0))
+	crossfade = min(max(1, crossfade), max(1, frames // 3))
+	# Begin after the head used at the seam.  The final blended frame therefore
+	# flows directly into output frame zero when the file repeats.
+	loop = values[:, crossfade:].copy()
+	fade_in = np.linspace(0.0, 1.0, crossfade, endpoint=True)
+	fade_out = 1.0 - fade_in
+	loop[:, -crossfade:] = values[:, -crossfade:] * fade_out + values[:, :crossfade] * fade_in
+	return parselmouth.Sound(np.clip(loop, -1.0, 1.0), sound.sampling_frequency)
+
+
+def loop_samples(
+	settings: LoopSettings,
+	on_progress: Callable[[int, int, str], None],
+	on_log: Callable[[str], None],
+	should_cancel: Callable[[], bool],
+) -> Path:
+	sources = [path for path in settings.source_paths if path.suffix.lower() == ".wav" and path.is_file()]
+	if not sources:
+		raise ValueError("Choose one or more WAV files to loop.")
+	settings.output_dir.mkdir(exist_ok=True)
+	for index, source in enumerate(sources, start=1):
+		if should_cancel():
+			raise CancelledError()
+		on_log(f"[{index}/{len(sources)}] Looping {source.name}")
+		sound = load_mono(source, settings.output_sample_rate)
+		if settings.trim_silence:
+			sound = trim_edge_silence(sound)
+		looped = make_seamless_loop(sound, settings.crossfade_ms)
+		output = settings.output_dir / f"{source.stem}_loop.wav"
+		looped.save(str(output), "WAV")
+		on_log(f"  wrote {output.name}")
+		on_progress(index, len(sources), source.name)
+	on_log(f"Saved {len(sources)} looped sample(s) in: {settings.output_dir}")
+	return settings.output_dir
+
+
 class GenerationWorker(QThread):
 	progress = Signal(int, int, str)
 	log = Signal(str)
@@ -715,6 +773,32 @@ class PrepareWorker(QThread):
 			self.done.emit(str(output))
 
 
+class LoopWorker(QThread):
+	progress = Signal(int, int, str)
+	log = Signal(str)
+	done = Signal(str)
+	failed = Signal(str)
+	cancelled = Signal(str)
+
+	def __init__(self, settings: LoopSettings) -> None:
+		super().__init__()
+		self.settings = settings
+		self._cancel = False
+
+	def request_cancel(self) -> None:
+		self._cancel = True
+
+	def run(self) -> None:
+		try:
+			output = loop_samples(self.settings, self.progress.emit, self.log.emit, lambda: self._cancel)
+		except CancelledError:
+			self.cancelled.emit("Looping cancelled.")
+		except Exception as error:
+			self.failed.emit(str(error))
+		else:
+			self.done.emit(str(output))
+
+
 class GeneratorWindow(QMainWindow):
 	def __init__(self) -> None:
 		super().__init__()
@@ -726,14 +810,16 @@ class GeneratorWindow(QMainWindow):
 		self.setMinimumSize(920, 620)
 		self.setAcceptDrops(True)
 
-		self.worker: GenerationWorker | PrepareWorker | None = None
+		self.worker: GenerationWorker | PrepareWorker | LoopWorker | None = None
 		self.last_output_path: Path | None = None
 		self.prepare_sources: tuple[Path, ...] = ()
+		self.loop_sources: tuple[Path, ...] = ()
 
 		self.tabs = QTabWidget()
 		self.setCentralWidget(self.tabs)
 		self.tabs.addTab(self.build_generate_tab(), "Generate")
 		self.tabs.addTab(self.build_prepare_tab(), "Prepare Samples")
+		self.tabs.addTab(self.build_loop_tab(), "Loop Samples")
 
 		self.statusBar().showMessage("Idle")
 		self.apply_system_brand_theme()
@@ -1013,6 +1099,76 @@ class GeneratorWindow(QMainWindow):
 
 		return tab
 
+	def build_loop_tab(self) -> QWidget:
+		tab = QWidget()
+		layout = QVBoxLayout(tab)
+		layout.setContentsMargins(16, 14, 16, 14)
+		content = QHBoxLayout()
+		layout.addLayout(content, 1)
+		controls = QVBoxLayout()
+		content.addLayout(controls, 0)
+
+		self.loop_source_input = QLineEdit()
+		self.loop_source_input.setReadOnly(True)
+		self.loop_source_input.setPlaceholderText("Choose one or more WAV samples to make seamless loops")
+		self.loop_files_button = QPushButton("Add WAV Samples")
+		self.loop_files_button.clicked.connect(self.choose_loop_files)
+		self.loop_folder_button = QPushButton("Add Folder")
+		self.loop_folder_button.clicked.connect(self.choose_loop_folder)
+		source_group = QGroupBox("Samples")
+		source_layout = QVBoxLayout(source_group)
+		source_layout.addWidget(self.loop_source_input)
+		source_buttons = QHBoxLayout()
+		source_buttons.addWidget(self.loop_files_button)
+		source_buttons.addWidget(self.loop_folder_button)
+		source_layout.addLayout(source_buttons)
+		controls.addWidget(source_group)
+
+		self.loop_crossfade_input = QSpinBox()
+		self.loop_crossfade_input.setRange(1, 1000)
+		self.loop_crossfade_input.setValue(30)
+		self.loop_crossfade_input.setSuffix(" ms")
+		self.loop_trim_input = QCheckBox("Trim quiet edges before looping")
+		self.loop_trim_input.setChecked(True)
+		self.loop_sample_rate_input = QComboBox()
+		self.loop_sample_rate_input.addItems(SAMPLE_RATES)
+		loop_group = QGroupBox("Seamless Loop")
+		loop_form = QFormLayout(loop_group)
+		loop_form.addRow("Crossfade:", self.loop_crossfade_input)
+		loop_form.addRow("Output sample rate:", self.loop_sample_rate_input)
+		loop_form.addRow("", self.loop_trim_input)
+		help_label = QLabel("The tail is crossfaded into the head, so each saved WAV can repeat without a waveform jump at its boundary. Output is saved as <name>_loop.wav in looped_samples.")
+		help_label.setWordWrap(True)
+		loop_form.addRow(help_label)
+		controls.addWidget(loop_group)
+
+		self.loop_button = QPushButton("Save Looped Samples")
+		self.loop_button.setEnabled(False)
+		self.loop_button.clicked.connect(self.loop_selected_samples)
+		self.loop_cancel_button = QPushButton("Cancel")
+		self.loop_cancel_button.setEnabled(False)
+		self.loop_cancel_button.clicked.connect(self.cancel_worker)
+		self.loop_open_button = QPushButton("Open Looped Folder")
+		self.loop_open_button.setEnabled(False)
+		self.loop_open_button.clicked.connect(self.open_last_output)
+		buttons = QHBoxLayout()
+		buttons.addWidget(self.loop_button)
+		buttons.addWidget(self.loop_cancel_button)
+		buttons.addWidget(self.loop_open_button)
+		controls.addLayout(buttons)
+		controls.addStretch(1)
+
+		self.loop_progress = QProgressBar()
+		self.loop_log_output = QTextEdit()
+		self.loop_log_output.setReadOnly(True)
+		self.loop_log_output.setPlaceholderText("Looping logs will appear here.")
+		output_group = QGroupBox("Output")
+		output_layout = QVBoxLayout(output_group)
+		output_layout.addWidget(self.loop_progress)
+		output_layout.addWidget(self.loop_log_output, 1)
+		content.addWidget(output_group, 1)
+		return tab
+
 	def system_theme_is_dark(self) -> bool:
 		scheme = QApplication.styleHints().colorScheme()
 		if scheme == Qt.ColorScheme.Dark:
@@ -1208,10 +1364,14 @@ class GeneratorWindow(QMainWindow):
 		if path.is_dir():
 			if self.tabs.currentIndex() == 1:
 				self.set_prepare_sources(tuple(sorted(path.glob("*.wav"))), path / "prepared_samples")
+			elif self.tabs.currentIndex() == 2:
+				self.set_loop_sources(tuple(sorted(path.glob("*.wav"))), path / "looped_samples")
 			else:
 				self.folder_input.setText(str(path))
 		elif path.suffix.lower() == ".wav" and self.tabs.currentIndex() == 1:
 			self.set_prepare_sources(tuple(Path(url.toLocalFile()) for url in urls), path.parent / "prepared_samples")
+		elif path.suffix.lower() == ".wav" and self.tabs.currentIndex() == 2:
+			self.set_loop_sources(tuple(Path(url.toLocalFile()) for url in urls), path.parent / "looped_samples")
 
 	def choose_folder(self) -> None:
 		folder = QFileDialog.getExistingDirectory(self, "Select sample folder")
@@ -1229,6 +1389,27 @@ class GeneratorWindow(QMainWindow):
 		if folder:
 			path = Path(folder)
 			self.set_prepare_sources(tuple(sorted(path.glob("*.wav"))), path / "prepared_samples")
+
+	def choose_loop_files(self) -> None:
+		files, _ = QFileDialog.getOpenFileNames(self, "Add WAV samples to loop", "", "WAV files (*.wav)")
+		if files:
+			paths = tuple(Path(path) for path in files)
+			self.set_loop_sources(paths, paths[0].parent / "looped_samples")
+
+	def choose_loop_folder(self) -> None:
+		folder = QFileDialog.getExistingDirectory(self, "Add a folder of WAV samples")
+		if folder:
+			path = Path(folder)
+			self.set_loop_sources(tuple(sorted(path.glob("*.wav"))), path / "looped_samples")
+
+	def set_loop_sources(self, paths: tuple[Path, ...], output_dir: Path) -> None:
+		self.loop_sources = tuple(path for path in paths if path.suffix.lower() == ".wav")
+		self.loop_output_dir = output_dir
+		if len(self.loop_sources) == 1:
+			self.loop_source_input.setText(str(self.loop_sources[0]))
+		else:
+			self.loop_source_input.setText(f"{len(self.loop_sources)} WAV file(s) -> {output_dir}")
+		self.loop_button.setEnabled(bool(self.loop_sources) and self.worker is None)
 
 	def set_prepare_sources(self, paths: tuple[Path, ...], output_dir: Path) -> None:
 		self.prepare_sources = tuple(path for path in paths if path.suffix.lower() == ".wav")
@@ -1365,7 +1546,32 @@ class GeneratorWindow(QMainWindow):
 		self.save_autosaved_options()
 		self.start_worker(PrepareWorker(settings), "Preparing samples...")
 
-	def start_worker(self, worker: GenerationWorker | PrepareWorker, status: str) -> None:
+	def loop_selected_samples(self) -> None:
+		if not self.loop_sources:
+			QMessageBox.critical(self, "ChromaKit", "Add WAV samples or a folder first.")
+			return
+		output_dir = getattr(self, "loop_output_dir", self.loop_sources[0].parent / "looped_samples")
+		if output_dir.exists() and any(output_dir.glob("*_loop.wav")):
+			answer = QMessageBox.question(
+				self, "ChromaKit", "'looped_samples' already contains looped WAV files. Overwrite matching files?",
+				QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+			)
+			if answer != QMessageBox.Yes:
+				self.statusBar().showMessage("Looping cancelled.")
+				return
+		settings = LoopSettings(
+			source_paths=self.loop_sources,
+			output_dir=output_dir,
+			crossfade_ms=int(self.loop_crossfade_input.value()),
+			trim_silence=self.loop_trim_input.isChecked(),
+			output_sample_rate=int(self.loop_sample_rate_input.currentText()),
+		)
+		self.loop_log_output.clear()
+		self.loop_progress.setRange(0, max(1, len(self.loop_sources)))
+		self.loop_progress.setValue(0)
+		self.start_worker(LoopWorker(settings), "Creating seamless loops...")
+
+	def start_worker(self, worker: GenerationWorker | PrepareWorker | LoopWorker, status: str) -> None:
 		self.worker = worker
 		worker.log.connect(self.append_log)
 		worker.progress.connect(self.on_progress)
@@ -1407,12 +1613,18 @@ class GeneratorWindow(QMainWindow):
 			self.padding_input,
 			self.prepare_sample_rate_input,
 		)
-		for widget in [*generation_inputs, *prepare_inputs]:
+		loop_inputs: Iterable[QWidget] = (
+			self.loop_source_input, self.loop_files_button, self.loop_folder_button,
+			self.loop_crossfade_input, self.loop_trim_input, self.loop_sample_rate_input,
+		)
+		for widget in [*generation_inputs, *prepare_inputs, *loop_inputs]:
 			widget.setEnabled(not busy)
 		self.cancel_button.setEnabled(busy)
 		self.prepare_cancel_button.setEnabled(busy)
 		self.generate_button.setEnabled(False if busy else self.generate_button.isEnabled())
 		self.prepare_button.setEnabled(False if busy else bool(self.prepare_sources))
+		self.loop_button.setEnabled(False if busy else bool(self.loop_sources))
+		self.loop_cancel_button.setEnabled(busy)
 
 	def cancel_worker(self) -> None:
 		if self.worker:
@@ -1420,7 +1632,12 @@ class GeneratorWindow(QMainWindow):
 			self.statusBar().showMessage("Cancelling...")
 
 	def append_log(self, message: str) -> None:
-		target = self.prepare_log_output if isinstance(self.worker, PrepareWorker) else self.log_output
+		if isinstance(self.worker, PrepareWorker):
+			target = self.prepare_log_output
+		elif isinstance(self.worker, LoopWorker):
+			target = self.loop_log_output
+		else:
+			target = self.log_output
 		target.append(message)
 		target.moveCursor(QTextCursor.End)
 
@@ -1429,6 +1646,9 @@ class GeneratorWindow(QMainWindow):
 		if isinstance(self.worker, PrepareWorker):
 			self.prepare_progress.setRange(0, total)
 			self.prepare_progress.setValue(done)
+		elif isinstance(self.worker, LoopWorker):
+			self.loop_progress.setRange(0, total)
+			self.loop_progress.setValue(done)
 		else:
 			self.progress.setRange(0, total)
 			self.progress.setValue(done)
@@ -1438,6 +1658,7 @@ class GeneratorWindow(QMainWindow):
 		self.last_output_path = Path(output)
 		self.open_output_button.setEnabled(True)
 		self.prepare_open_button.setEnabled(True)
+		self.loop_open_button.setEnabled(True)
 		self.statusBar().showMessage(f"Done: {output}", 8000)
 		QMessageBox.information(self, "ChromaKit", f"Created {output}")
 
@@ -1449,6 +1670,8 @@ class GeneratorWindow(QMainWindow):
 		self.statusBar().showMessage(message, 8000)
 		if isinstance(self.worker, PrepareWorker):
 			self.prepare_progress.setValue(0)
+		elif isinstance(self.worker, LoopWorker):
+			self.loop_progress.setValue(0)
 		else:
 			self.progress.setValue(0)
 
@@ -1457,6 +1680,7 @@ class GeneratorWindow(QMainWindow):
 		self.set_busy(False)
 		self.refresh_generation_validation()
 		self.prepare_button.setEnabled(bool(self.prepare_sources))
+		self.loop_button.setEnabled(bool(self.loop_sources))
 
 	def open_last_output(self) -> None:
 		if not self.last_output_path:
