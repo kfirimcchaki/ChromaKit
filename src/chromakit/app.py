@@ -55,8 +55,9 @@ AUDIO_STYLES = {
 	"Formant corrected": "Praat Change gender - preserve formants while shifting pitch",
 	"Vocal strain": "Formant-aware, restrained vocal effort for upward notes",
 	"Bright belt": "Praat pitch with bright, supported high-note presence",
-	"Scream / belt": "Praat pitch with stronger dynamic scream and belt texture",
-	"Rasp": "Praat pitch with a rougher, driven high-note edge",
+	"Yell / shout": "Natural-formant high-note shout that grows with pitch",
+	"Scream / belt": "Natural-formant scream and belt for high notes",
+	"Rasp": "Clean, human-style vocal rasp without synthetic flutter",
 }
 
 # Expressive styles start building effort only after a moderate upward shift.  This
@@ -345,11 +346,13 @@ def retune_sound(sound: parselmouth.Sound, target_frequency: float, audio_style:
 	if audio_style == "Vocal strain":
 		return retune_with_expressive_voice(sound, target_frequency, maximum_drive=0.38)
 	if audio_style == "Bright belt":
-		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.46, roughness=0.0)
+		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.34)
+	if audio_style == "Yell / shout":
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.42)
 	if audio_style == "Scream / belt":
-		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.76, roughness=0.18)
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.58)
 	if audio_style == "Rasp":
-		return retune_with_praat_expression(sound, target_frequency, maximum_drive=0.62, roughness=0.32)
+		return retune_with_human_scream(sound, target_frequency, maximum_drive=0.46)
 	if target_frequency < LOW_NOTE_FFT_THRESHOLD:
 		retuned = retune_with_fft(sound, target_frequency)
 		if retuned is not None:
@@ -447,10 +450,9 @@ def apply_vocal_drive(sound: parselmouth.Sound, effort: float, maximum_drive: fl
 	saturated = np.tanh(normalized * drive) / math.tanh(drive)
 	previous = np.concatenate((normalized[:, :1], normalized[:, :-1]), axis=1)
 	presence = normalized - 0.90 * previous
-	presence_peak = float(np.max(np.abs(presence)))
-	if presence_peak > 1e-9:
-		presence /= presence_peak
-	mixed = (1.0 - amount) * normalized + amount * saturated + (0.13 * amount) * presence
+	# Keep the natural scale of the differentiated signal.  Normalizing it to its
+	# single highest sample exaggerates clicks and makes the old Rasp preset hiss.
+	mixed = (1.0 - amount) * normalized + amount * saturated + (0.30 * amount) * presence
 	# Keep the source peak (and therefore downstream normalization behavior) stable.
 	mixed_peak = max(float(np.max(np.abs(mixed))), 1e-9)
 	return parselmouth.Sound(np.clip(mixed * (peak / mixed_peak), -1.0, 1.0), sound.sampling_frequency)
@@ -479,32 +481,25 @@ def retune_with_expressive_voice(
 	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
-def apply_vocal_roughness(sound: parselmouth.Sound, effort: float, roughness: float) -> parselmouth.Sound:
-	"""Add a bounded, deterministic flutter to emulate vocal-fold irregularity."""
-	amount = float(np.clip(effort * roughness, 0.0, 0.35))
-	if amount <= 0:
-		return sound
-	values = np.asarray(sound.values, dtype=np.float64)
-	frames = values.shape[1]
-	if frames < 2:
-		return sound
-	time = np.arange(frames, dtype=np.float64) / sound.sampling_frequency
-	# Two slow, inharmonic flutter rates avoid a fixed tremolo tone.  This only
-	# becomes audible high above the source pitch where vocal effort is expected.
-	flutter = 1.0 + amount * (0.58 * np.sin(2.0 * math.pi * 27.0 * time) + 0.42 * np.sin(2.0 * math.pi * 41.0 * time + 0.7))
-	return parselmouth.Sound(np.clip(values * flutter.reshape(1, -1), -1.0, 1.0), sound.sampling_frequency)
+def retune_with_human_scream(sound: parselmouth.Sound, target_frequency: float, maximum_drive: float) -> parselmouth.Sound:
+	"""Use the higher-quality formant-aware path for human-style yells and screams.
+
+	Real vocal fry/rasp cannot be recovered from a clean sample by adding a fixed
+	modulator.  This keeps the source's own vocal detail, shifts formants only as
+	the note climbs, and applies restrained harmonic compression instead.
+	"""
+	return retune_with_expressive_voice(sound, target_frequency, maximum_drive)
 
 
 def retune_with_praat_expression(
-	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float, roughness: float,
+	sound: parselmouth.Sound, target_frequency: float, maximum_drive: float,
 ) -> parselmouth.Sound:
 	"""Build expressive styles on ChromaKit's direct Praat resynthesis path."""
 	effort = vocal_effort_for_interval(estimated_voice_frequency(sound), target_frequency)
 	# Unlike the formant-corrected style, this starts with the direct Praat pitch
 	# tier.  It keeps the familiar FNF pitch character before adding expression.
 	retuned = retune_with_praat(sound, target_frequency)
-	retuned = apply_vocal_drive(retuned, effort, maximum_drive)
-	return apply_vocal_roughness(retuned, effort, roughness)
+	return apply_vocal_drive(retuned, effort, maximum_drive)
 
 
 def retune_with_fft(sound: parselmouth.Sound, target_frequency: float) -> parselmouth.Sound | None:
